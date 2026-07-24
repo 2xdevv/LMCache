@@ -1567,47 +1567,114 @@ class RawBlockCore:
 
     def _snapshot_state(self) -> tuple[dict[str, Any], int]:
         """Build a JSON-serializable checkpoint state snapshot."""
+        dirty_total, data_base_offset, next_slot, index_copy = (
+            self._capture_checkpoint_state()
+        )
+        snapshot = self._build_snapshot_state(
+            data_base_offset,
+            next_slot,
+            index_copy,
+        )
+        return snapshot, dirty_total
+
+    def _capture_checkpoint_state(
+        self,
+    ) -> tuple[int, int, int, dict[str, _Entry]]:
+        """Capture the mutable checkpoint source state under the core lock."""
         with self._lock:
             dirty_total = self._meta_dirty_total
-            snapshot = {
-                "version": 1,
-                "device_path": self.device_path,
-                "capacity_bytes": self.capacity_bytes,
-                "block_align": self.block_align,
-                "header_bytes": self.header_bytes,
-                "slot_bytes": self.slot_bytes,
-                "meta_total_bytes": self.meta_total_bytes,
-                "meta_magic": self.meta_magic_text,
-                "meta_version": self.meta_version,
-                "data_base_offset": self._data_base_offset,
-                "next_slot": self._next_slot,
-                "entries": {
-                    encoded_key: {
-                        "offset": entry.offset,
-                        "size": entry.meta.size,
-                        "shape": list(entry.meta.shape)
-                        if entry.meta.shape is not None
-                        else None,
-                        "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
-                        "fmt": (
-                            entry.meta.fmt.name
-                            if entry.meta.fmt is not None
-                            and hasattr(entry.meta.fmt, "name")
-                            else str(entry.meta.fmt)
-                            if entry.meta.fmt is not None
-                            else None
-                        ),
-                        "cached_positions": (
-                            entry.meta.cached_positions.tolist()
-                            if entry.meta.cached_positions is not None
-                            and hasattr(entry.meta.cached_positions, "tolist")
-                            else None
-                        ),
-                    }
-                    for encoded_key, entry in self._index.items()
-                },
-            }
-        return snapshot, dirty_total
+            data_base_offset = self._data_base_offset
+            next_slot = self._next_slot
+            index_copy = self._index.copy()
+        return dirty_total, data_base_offset, next_slot, index_copy
+
+    def _build_snapshot_state(
+        self,
+        data_base_offset: int,
+        next_slot: int,
+        index: dict[str, _Entry],
+    ) -> dict[str, Any]:
+        """Convert detached checkpoint source state to a JSON-compatible dict."""
+        return {
+            "version": 1,
+            "device_path": self.device_path,
+            "capacity_bytes": self.capacity_bytes,
+            "block_align": self.block_align,
+            "header_bytes": self.header_bytes,
+            "slot_bytes": self.slot_bytes,
+            "meta_total_bytes": self.meta_total_bytes,
+            "meta_magic": self.meta_magic_text,
+            "meta_version": self.meta_version,
+            "data_base_offset": data_base_offset,
+            "next_slot": next_slot,
+            "entries": {
+                encoded_key: {
+                    "offset": entry.offset,
+                    "size": entry.meta.size,
+                    "shape": (
+                        list(entry.meta.shape) if entry.meta.shape is not None else None
+                    ),
+                    "dtype": self._checkpoint_dtype_name(entry.meta.dtype),
+                    "fmt": (
+                        entry.meta.fmt.name
+                        if entry.meta.fmt is not None
+                        and hasattr(entry.meta.fmt, "name")
+                        else str(entry.meta.fmt)
+                        if entry.meta.fmt is not None
+                        else None
+                    ),
+                    "cached_positions": (
+                        entry.meta.cached_positions.tolist()
+                        if entry.meta.cached_positions is not None
+                        and hasattr(entry.meta.cached_positions, "tolist")
+                        else None
+                    ),
+                }
+                for encoded_key, entry in index.items()
+            },
+        }
+
+    def _serialize_checkpoint_payload(self) -> tuple[bytes, int]:
+        """Build checkpoint bytes with Rust, falling back for an old extension."""
+        dirty_total, data_base_offset, next_slot, index_copy = (
+            self._capture_checkpoint_state()
+        )
+
+        # Third Party
+        import lmcache_rust_raw_block_io  # type: ignore
+
+        serialize_raw_block_checkpoint_payload = getattr(
+            lmcache_rust_raw_block_io,
+            "serialize_raw_block_checkpoint_payload",
+            None,
+        )
+        if serialize_raw_block_checkpoint_payload is None:
+            snapshot = self._build_snapshot_state(
+                data_base_offset,
+                next_slot,
+                index_copy,
+            )
+            payload = json.dumps(
+                snapshot,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+            return payload, dirty_total
+
+        payload = serialize_raw_block_checkpoint_payload(
+            self.device_path,
+            self.capacity_bytes,
+            self.block_align,
+            self.header_bytes,
+            self.slot_bytes,
+            self.meta_total_bytes,
+            self.meta_magic_text,
+            self.meta_version,
+            data_base_offset,
+            next_slot,
+            index_copy,
+        )
+        return payload, dirty_total
 
     def _checkpoint_dtype_name(self, dtype: torch.dtype | None) -> str | None:
         """Return a durable checkpoint string for a torch dtype.
@@ -1678,10 +1745,7 @@ class RawBlockCore:
         if not force and not idle_ok:
             return False
 
-        snapshot, dirty_total_snapshot = self._snapshot_state()
-        payload = json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True).encode(
-            "utf-8"
-        )
+        payload, dirty_total_snapshot = self._serialize_checkpoint_payload()
         return self._write_checkpoint(payload, dirty_total_snapshot)
 
     def _is_valid_checkpoint_entry(self, offset: int, size: int) -> bool:

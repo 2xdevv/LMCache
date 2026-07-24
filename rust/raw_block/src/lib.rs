@@ -15,6 +15,9 @@
 //!   submission/completion loop. All alignment checks are performed before
 //!   enqueuing; violations result in an immediate Python `ValueError`.
 
+mod checkpoint;
+
+use checkpoint::serialize_raw_block_checkpoint_payload;
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -3100,5 +3103,6 @@ impl Drop for RawBlockDevice {
 #[pymodule]
 fn lmcache_rust_raw_block_io(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RawBlockDevice>()?;
+    m.add_function(wrap_pyfunction!(serialize_raw_block_checkpoint_payload, m)?)?;
     Ok(())
 }

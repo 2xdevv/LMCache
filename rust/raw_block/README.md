@@ -6,9 +6,26 @@ PyO3. It is used by both:
 - the legacy non-MP `RustRawBlockBackend`
 - the MP `raw_block` L2 adapter (`RawBlockL2Adapter`) via `RawBlockCore`
 
-The Rust crate intentionally stays narrow: it owns the raw device handle and
-exposes blocking `pwrite_from_buffer` / `pread_into` primitives. Slotting,
-checkpointing, recovery, and MP task orchestration all live in Python.
+The Rust crate intentionally stays narrow: it owns the raw device handle,
+exposes blocking `pwrite_from_buffer` / `pread_into` primitives, and serializes
+raw-block checkpoint metadata. Slot allocation, checkpoint scheduling and
+device writes, recovery, and MP task orchestration remain in Python.
+
+## Checkpoint Serialization
+
+`RawBlockCore` captures a shallow, stable copy of its metadata index under its
+lock, then calls `serialize_raw_block_checkpoint_payload`. Rust streams that
+index directly into the final compact UTF-8 JSON bytes, avoiding the previous
+intermediate Python entry dictionaries, JSON string, and encoding copy. The
+payload remains byte-compatible with Python's
+`json.dumps(..., separators=(",", ":"), ensure_ascii=True)`.
+
+No block device is needed to benchmark serialization:
+
+```bash
+python benchmarks/microbenchmark/raw_block_snapshot_benchmark.py \
+  --implementation rust
+```
 
 ## I/O Engines
 
