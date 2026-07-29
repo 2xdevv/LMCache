@@ -7,6 +7,7 @@ persist, secondary lookup, and capacity management.
 """
 
 # Standard
+from collections.abc import Iterator
 import os
 import select
 import shutil
@@ -188,6 +189,34 @@ def adapter_with_persist():
 
     yield adpt, buffer, tmp_dir, l1_memory, config
 
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def one_page_capacity_adapter() -> Iterator[
+    tuple[DynamicNixlStoreL2Adapter, torch.Tensor, str]
+]:
+    """Create an adapter whose capacity is exactly one L1 page."""
+    tmp_dir = tempfile.mkdtemp(prefix="nixl_dyn_cap_test_")
+    buffer = torch.empty(PAGE_SIZE * NUM_BUFFER_PAGES, dtype=torch.uint8, device="cpu")
+    l1_memory = L1MemoryDesc(
+        ptr=buffer.data_ptr(),
+        size=buffer.numel(),
+        align_bytes=PAGE_SIZE,
+    )
+    config = DynamicNixlStoreL2AdapterConfig(
+        backend="POSIX",
+        backend_params={
+            "file_path": tmp_dir,
+            "use_direct_io": "false",
+            "max_capacity_gb": str(PAGE_SIZE / (1024**3)),
+        },
+    )
+    adpt = DynamicNixlStoreL2Adapter(config, l1_memory)
+
+    yield adpt, buffer, tmp_dir
+
+    adpt.close()
     shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -647,54 +676,123 @@ class TestCapacity:
 
         assert usage_after < usage_before
 
-    def test_store_rejected_when_capacity_exceeded(self):
-        """Store should stop when max capacity is reached."""
-        tmp_dir = tempfile.mkdtemp(prefix="nixl_dyn_cap_test_")
-        try:
-            buffer = torch.empty(
-                PAGE_SIZE * NUM_BUFFER_PAGES, dtype=torch.uint8, device="cpu"
-            )
-            l1_memory = L1MemoryDesc(
-                ptr=buffer.data_ptr(),
-                size=buffer.numel(),
-                align_bytes=PAGE_SIZE,
-            )
-            # Very small capacity: 1 page worth of data
-            tiny_cap_gb = PAGE_SIZE / (1024**3)
-            config = DynamicNixlStoreL2AdapterConfig(
-                backend="POSIX",
-                backend_params={
-                    "file_path": tmp_dir,
-                    "use_direct_io": "false",
-                    "max_capacity_gb": str(tiny_cap_gb),
-                },
-            )
-            adpt = DynamicNixlStoreL2Adapter(config, l1_memory)
+    def test_store_rejected_when_capacity_exceeded(
+        self,
+        one_page_capacity_adapter: tuple[DynamicNixlStoreL2Adapter, torch.Tensor, str],
+    ) -> None:
+        """A store that exceeds remaining capacity should report failure."""
+        adpt, buffer, tmp_dir = one_page_capacity_adapter
+        key1 = create_object_key(1)
+        obj1 = create_memory_obj(buffer, page_index=0)
+        first_task = adpt.submit_store_task([key1], [obj1])
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        first_result = adpt.pop_completed_store_tasks()[first_task]
+        assert first_result.is_successful()
+        assert first_result.bytes_transferred() == PAGE_SIZE
 
-            # Store first object (should succeed)
-            key1 = create_object_key(1)
-            obj1 = create_memory_obj(buffer, page_index=0)
-            adpt.submit_store_task([key1], [obj1])
-            wait_for_event_fd(adpt.get_store_event_fd())
+        usage_before = adpt.get_usage().total_bytes_used
+        key2 = create_object_key(2)
+        obj2 = create_memory_obj(buffer, page_index=1)
+        rejected_task = adpt.submit_store_task([key2], [obj2])
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        rejected_result = adpt.pop_completed_store_tasks()[rejected_task]
 
-            # Store second object (should be rejected due to capacity)
-            key2 = create_object_key(2)
-            obj2 = create_memory_obj(buffer, page_index=1)
-            adpt.submit_store_task([key2], [obj2])
-            wait_for_event_fd(adpt.get_store_event_fd())
+        assert not rejected_result.is_successful()
+        assert rejected_result.bytes_transferred() == 0
+        assert adpt.get_usage().total_bytes_used == usage_before
+        assert not os.path.exists(os.path.join(tmp_dir, _object_key_to_filename(key2)))
 
-            # Only first key should be found
-            task_id = adpt.submit_lookup_and_lock_task([key1, key2], _EMPTY_LAYOUT)
-            wait_for_event_fd(adpt.get_lookup_and_lock_event_fd())
-            bitmap = adpt.query_lookup_and_lock_result(task_id)
-            assert bitmap is not None
-            assert bitmap.test(0)  # key1 found
-            assert not bitmap.test(1)  # key2 not found
+        task_id = adpt.submit_lookup_and_lock_task([key1, key2], _EMPTY_LAYOUT)
+        assert wait_for_event_fd(adpt.get_lookup_and_lock_event_fd())
+        bitmap = adpt.query_lookup_and_lock_result(task_id)
+        assert bitmap is not None
+        assert bitmap.test(0)
+        assert not bitmap.test(1)
+        adpt.submit_unlock([key1])
 
-            adpt.submit_unlock([key1])
-            adpt.close()
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+    def test_multi_key_store_rejected_atomically(
+        self,
+        one_page_capacity_adapter: tuple[DynamicNixlStoreL2Adapter, torch.Tensor, str],
+    ) -> None:
+        """An oversized batch should not store any of its keys."""
+        adpt, buffer, tmp_dir = one_page_capacity_adapter
+        keys = [create_object_key(1), create_object_key(2)]
+        objects = [
+            create_memory_obj(buffer, page_index=0),
+            create_memory_obj(buffer, page_index=1),
+        ]
+
+        task_id = adpt.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        result = adpt.pop_completed_store_tasks()[task_id]
+
+        assert not result.is_successful()
+        assert result.bytes_transferred() == 0
+        assert adpt.get_usage().total_bytes_used == 0
+        assert all(
+            not os.path.exists(os.path.join(tmp_dir, _object_key_to_filename(key)))
+            for key in keys
+        )
+
+        lookup_task = adpt.submit_lookup_and_lock_task(keys, _EMPTY_LAYOUT)
+        assert wait_for_event_fd(adpt.get_lookup_and_lock_event_fd())
+        bitmap = adpt.query_lookup_and_lock_result(lookup_task)
+        assert bitmap is not None
+        assert not bitmap.test(0)
+        assert not bitmap.test(1)
+
+    def test_duplicate_store_succeeds_without_capacity(
+        self,
+        one_page_capacity_adapter: tuple[DynamicNixlStoreL2Adapter, torch.Tensor, str],
+    ) -> None:
+        """An existing key should remain a successful zero-byte no-op."""
+        adpt, buffer, _ = one_page_capacity_adapter
+        key = create_object_key(1)
+        obj = create_memory_obj(buffer, page_index=0)
+
+        first_task = adpt.submit_store_task([key], [obj])
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        assert adpt.pop_completed_store_tasks()[first_task].is_successful()
+
+        duplicate_task = adpt.submit_store_task([key], [obj])
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        duplicate_result = adpt.pop_completed_store_tasks()[duplicate_task]
+
+        assert duplicate_result.is_successful()
+        assert duplicate_result.bytes_transferred() == 0
+        assert adpt.get_usage().total_bytes_used == PAGE_SIZE
+
+    def test_failed_transfer_releases_batch_reservations(
+        self,
+        adapter: tuple[DynamicNixlStoreL2Adapter, torch.Tensor, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A transfer failure should leave the whole batch retryable."""
+        adpt, buffer, _ = adapter
+        keys = [create_object_key(1), create_object_key(2)]
+        objects = [
+            create_memory_obj(buffer, page_index=0),
+            create_memory_obj(buffer, page_index=1),
+        ]
+        original_store = adpt.nixl_agent.dynamic_store_file
+
+        async def fail_store(*_args: object) -> None:
+            raise RuntimeError("injected store failure")
+
+        monkeypatch.setattr(adpt.nixl_agent, "dynamic_store_file", fail_store)
+        failed_task = adpt.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        failed_result = adpt.pop_completed_store_tasks()[failed_task]
+        assert not failed_result.is_successful()
+        assert failed_result.bytes_transferred() == 0
+        assert adpt.get_usage().total_bytes_used == 0
+
+        monkeypatch.setattr(adpt.nixl_agent, "dynamic_store_file", original_store)
+        retry_task = adpt.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adpt.get_store_event_fd())
+        retry_result = adpt.pop_completed_store_tasks()[retry_task]
+        assert retry_result.is_successful()
+        assert retry_result.bytes_transferred() == 2 * PAGE_SIZE
 
 
 # =============================================================================

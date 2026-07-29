@@ -593,63 +593,84 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
     ) -> None:
         """Store each key-object pair to its own file via dynamic DMA write."""
+        stores_to_execute: list[tuple[ObjectKey, MemoryObj, int]] = []
         success = True
         stored_keys: list[ObjectKey] = []
         stored_sizes: list[int] = []
         try:
-            for key, obj in zip(keys, objects, strict=False):
-                mem_addr = obj.meta.address
-                mem_size = obj.meta.phy_size
-
-                # Reserve the key and capacity under the lock *before*
-                # the DMA write so that concurrent coroutines (other
-                # stores, secondary lookups) see the reservation.
-                with self._lock:
-                    if key in self._memory_objects or key in self._inflight_stores:
+            seen_keys: set[ObjectKey] = set()
+            with self._lock:
+                for key, obj in zip(keys, objects, strict=False):
+                    if (
+                        key in seen_keys
+                        or key in self._memory_objects
+                        or key in self._inflight_stores
+                    ):
                         continue
-                    if self._total_bytes + mem_size > self._max_capacity_bytes:
-                        logger.warning(
-                            "Storage capacity exceeded, skipping store for key %s",
-                            key,
+                    seen_keys.add(key)
+                    stores_to_execute.append((key, obj, obj.meta.phy_size))
+
+                required_bytes = sum(size for _, _, size in stores_to_execute)
+                if self._total_bytes + required_bytes > self._max_capacity_bytes:
+                    logger.warning(
+                        "Storage capacity exceeded, rejecting store task %d "
+                        "(used=%d, requested=%d, max=%d)",
+                        task_id,
+                        self._total_bytes,
+                        required_bytes,
+                        self._max_capacity_bytes,
+                    )
+                    success = False
+                else:
+                    self._inflight_stores.update(key for key, _, _ in stores_to_execute)
+                    self._total_bytes += required_bytes
+
+            if success:
+                for key, obj, mem_size in stores_to_execute:
+                    mem_addr = obj.meta.address
+
+                    try:
+                        mem_indices = self.nixl_agent.get_memory_indices(
+                            mem_addr, mem_size
                         )
-                        break
-                    self._inflight_stores.add(key)
-                    self._total_bytes += mem_size
+                        file_path = self.nixl_agent.get_file_path_for_key(key)
 
-                try:
-                    mem_indices = self.nixl_agent.get_memory_indices(mem_addr, mem_size)
-                    file_path = self.nixl_agent.get_file_path_for_key(key)
+                        await self.nixl_agent.dynamic_store_file(
+                            mem_indices, file_path, self.nixl_agent.l1_align_bytes
+                        )
 
-                    await self.nixl_agent.dynamic_store_file(
-                        mem_indices, file_path, self.nixl_agent.l1_align_bytes
-                    )
-
-                    store_obj = NixlStoreObj(
-                        page_indices=[],  # not used in dynamic mode
-                        size=mem_size,
-                        layout=MemoryLayoutDesc(
-                            [obj.meta.shape],
-                            [obj.meta.dtype],
-                        ),
-                        pin_count=1,
-                    )
-                    with self._lock:
-                        self._inflight_stores.discard(key)
-                        self._memory_objects[key] = store_obj
-                        store_obj.decrease_pin_count()
-                    stored_keys.append(key)
-                    stored_sizes.append(mem_size)
-                except Exception:
-                    # Un-reserve on failure so capacity accounting
-                    # stays correct.
-                    with self._lock:
-                        self._inflight_stores.discard(key)
-                        self._total_bytes -= mem_size
-                    raise
+                        store_obj = NixlStoreObj(
+                            page_indices=[],  # not used in dynamic mode
+                            size=mem_size,
+                            layout=MemoryLayoutDesc(
+                                [obj.meta.shape],
+                                [obj.meta.dtype],
+                            ),
+                            pin_count=1,
+                        )
+                        with self._lock:
+                            self._inflight_stores.discard(key)
+                            self._memory_objects[key] = store_obj
+                            store_obj.decrease_pin_count()
+                        stored_keys.append(key)
+                        stored_sizes.append(mem_size)
+                    except Exception:
+                        # Un-reserve on failure so capacity accounting
+                        # stays correct.
+                        with self._lock:
+                            self._inflight_stores.discard(key)
+                            self._total_bytes -= mem_size
+                        raise
 
         except Exception:
             logger.exception("Dynamic NIXL store task %d failed", task_id)
             success = False
+            with self._lock:
+                for key, _, mem_size in stores_to_execute:
+                    if key not in self._inflight_stores:
+                        continue
+                    self._inflight_stores.remove(key)
+                    self._total_bytes -= mem_size
 
         if stored_keys:
             self._notify_keys_stored(stored_keys, stored_sizes)
