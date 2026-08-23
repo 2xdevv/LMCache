@@ -194,10 +194,15 @@ class LMCacheMPConnector:
         self._heartbeat_interval = heartbeat_interval
         self._registered = False
         self._heartbeat: HeartbeatThread | None = None
+        self._closing = threading.Event()
         self._health_event = threading.Event()
         self._health_event.set()
         self._pending_lookups: dict[str, _PendingLookup] = {}
         self._pending_lookups_lock = threading.Lock()
+        # Keep stable references to the engine-owned pools so a recovered
+        # daemon can import fresh IPC handles without restarting SGLang.
+        self._k_pool = list(k_pool)
+        self._v_pool = list(v_pool)
 
         self.context = zmq.Context.instance()
         self.mq_client = MessageQueueClient(f"tcp://{host}:{port}", self.context)
@@ -219,19 +224,7 @@ class LMCacheMPConnector:
         # SGLang is non-hybrid (a single KV cache group), so engine_group_infos is the
         # empty list -- which the server treats as one group spanning all layers
         # (matching the vLLM non-hybrid and TensorRT-LLM register paths).
-        send_lmcache_request(
-            self.mq_client,
-            RequestType.REGISTER_KV_CACHE,
-            [
-                self.instance_id,
-                _wrap_sglang_kv_caches(k_pool, v_pool),
-                self.model_name,
-                self.tp_size,
-                EngineType.SGLANG,
-                {"tokens_per_block": self.page_size},
-                [],
-            ],
-        ).result(timeout=self._mq_timeout)
+        self._send_register_kv_caches_request()
         self._registered = True
         self._start_heartbeat()
 
@@ -244,7 +237,76 @@ class LMCacheMPConnector:
             interval=self._heartbeat_interval,
             instance_id=self.instance_id,
         )
+        self._heartbeat.register_recover_callback(self._reregister_kv_caches_callback)
         self._heartbeat.start()
+
+    def _send_register_kv_caches_request(self) -> None:
+        """Register the retained SGLang KV pools and wait for completion."""
+        send_lmcache_request(
+            self.mq_client,
+            RequestType.REGISTER_KV_CACHE,
+            [
+                self.instance_id,
+                _wrap_sglang_kv_caches(self._k_pool, self._v_pool),
+                self.model_name,
+                self.tp_size,
+                EngineType.SGLANG,
+                {"tokens_per_block": self.page_size},
+                [],
+            ],
+        ).result(timeout=self._mq_timeout)
+
+    def _heartbeat_stop_requested(self) -> bool:
+        """Return whether connector shutdown or heartbeat stop has begun."""
+        heartbeat = self._heartbeat
+        return self._closing.is_set() or (
+            heartbeat is not None and heartbeat.stop_requested
+        )
+
+    def _reregister_kv_caches_callback(self) -> bool:
+        """Restore daemon GPU context before heartbeat recovery is exposed.
+
+        Returns:
+            ``True`` after registration succeeds, or ``False`` when shutdown
+            has started or registration fails. A ``False`` result keeps the
+            health event cleared so the next successful heartbeat retries.
+        """
+        if self._heartbeat_stop_requested():
+            logger.info(
+                "Heartbeat stop requested; skipping SGLang KV cache re-registration"
+            )
+            return False
+
+        try:
+            self._send_register_kv_caches_request()
+        except Exception:
+            logger.exception(
+                "Failed to re-register SGLang KV caches after server recovery; "
+                "will retry on next heartbeat"
+            )
+            return False
+
+        # close() may have started while registration was waiting for its
+        # response. Keep health cleared; close() will unregister this context.
+        if self._heartbeat_stop_requested():
+            logger.info(
+                "Connector shutdown started during SGLang KV cache re-registration"
+            )
+            return False
+
+        # LOOKUP jobs, held locks, and sessions belonged to the old daemon.
+        # They must never be reused against the newly registered context.
+        with self._pending_lookups_lock:
+            pending_lookup_count = len(self._pending_lookups)
+            self._pending_lookups.clear()
+        if pending_lookup_count:
+            logger.warning(
+                "Discarded %d pending SGLang lookup(s) after server recovery",
+                pending_lookup_count,
+            )
+
+        logger.warning("Finished re-registering SGLang KV caches after server recovery")
+        return True
 
     @property
     def is_healthy(self) -> bool:
@@ -679,6 +741,7 @@ class LMCacheMPConnector:
         pass
 
     def close(self) -> None:
+        self._closing.set()
         self.reset()
         if self._heartbeat is not None:
             self._heartbeat.stop()
