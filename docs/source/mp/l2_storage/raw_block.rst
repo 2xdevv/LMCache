@@ -59,6 +59,11 @@ caller-provided load buffers during prefetch.
   falling back to any free slot. ``"none"`` disables affinity-based reuse. The
   default is ``"pid_affinity"`` when ``fdp_enabled=true`` and ``"none"``
   otherwise.
+- ``fdp_mapping_recovery_enabled``: Persist and recover cache-salt bucket/rank
+  to FDP placement-identifier assignments in raw-block metadata checkpoints.
+  The default is ``false``. Enabling it requires ``fdp_enabled=true``,
+  ``load_checkpoint_on_init=true``, and either the ``"cache_salt_prefix"`` or
+  ``"cache_salt_rank"`` data placement policy.
 - ``meta_checkpoint_placement_id``: Optional non-zero placement identifier for
   metadata checkpoint payload/header writes. Omit it to keep checkpoint writes
   on default NVMe placement.
@@ -129,9 +134,24 @@ caller-provided load buffers during prefetch.
   adapter detects at least eight visible GPUs. Applications using the same
   prefix share the placement identifiers for equal local ranks instead of
   receiving separate sets.
-- Bucket-to-placement assignments are process-local. Restart recovery does not
-  need them for correctness because ``cache_salt`` is part of the object key,
-  but first-seen FDP placement assignments may change after adapter restart.
+- Bucket-to-placement assignments remain process-local by default. Restart
+  recovery does not need them for read correctness because ``cache_salt`` is
+  part of the object key, but first-seen FDP assignments may change after an
+  adapter restart when ``fdp_mapping_recovery_enabled=false``.
+- With ``fdp_mapping_recovery_enabled=true``, checkpoints include the complete
+  bucket/rank assignment map and the configured placement pool's PID-to-RUHID
+  fingerprint. Startup reads the optional mapping from the checkpoint, queries
+  the live FDP status, and then validates the complete mapping. Every saved
+  assignment is restored together or none is restored. A changed PID-to-RUHID
+  fingerprint, changed data-placement policy, unreadable mapping, or assignment
+  to an unavailable PID rejects and removes the entire saved FDP mapping. The
+  raw cache index still recovers because FDP placement is not used to locate
+  reads.
+- The first startup with ``fdp_mapping_recovery_enabled=true`` has no mapping to
+  recover from checkpoints written by older or disabled runs. It begins
+  checkpointing assignments as buckets/ranks are first observed, making them
+  available to the next restart. Disabling recovery clears a previously saved
+  mapping so it cannot become stale while process-local assignments evolve.
 - Slot affinity is process-local and is not stored in metadata checkpoints.
   After recovery, free slots have no recorded affinity until they are reused.
 - Store and retrieve requests must use the same ``cache_salt`` to address the
@@ -158,6 +178,9 @@ caller-provided load buffers during prefetch.
 
     # With FDP discovery and cache_salt/rank placement enabled
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_data_placement_policy": "cache_salt_rank", "use_odirect": false}'
+
+    # With durable, atomically validated FDP bucket assignments
+    --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_mapping_recovery_enabled": true, "use_odirect": false}'
 
     # With FDP discovery only, keeping KV data writes on default NVMe placement
     --l2-adapter '{"type": "raw_block", "device_path": "/dev/ng0n1", "slot_bytes": 1048576, "io_engine": "io_uring", "use_uring_cmd": true, "fdp_enabled": true, "fdp_data_placement_policy": "none", "use_odirect": false}'

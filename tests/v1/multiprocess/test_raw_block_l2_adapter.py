@@ -39,6 +39,7 @@ from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (  # noqa: E
 from lmcache.v1.storage_backend.raw_block import RawBlockPutManyResult  # noqa: E402
 
 _EMPTY_LAYOUT = MemoryLayoutDesc(shapes=[], dtypes=[])
+_FDP_MAPPING_CHECKPOINT_KEY = "fdp_mapping"
 
 
 def _make_adapter(tmp_path: Path) -> RawBlockL2Adapter:
@@ -124,14 +125,30 @@ def test_raw_block_l2_adapter_delete_makes_key_miss(tmp_path):
 
 
 class _FakeFdpCore:
-    def __init__(self, status: list[tuple[int, int]] | None = None) -> None:
+    def __init__(
+        self,
+        status: list[tuple[int, int]] | None = None,
+        checkpoint_mapping: Any | None = None,
+    ) -> None:
         self.status = status if status is not None else [(0, 10), (7, 17)]
         self.slot_bytes = RAW_BLOCK_CI_SLOT_BYTES
         self.meta_checkpoint_placement_id: int | None = None
         self.put_many_calls: list[list[int | None] | None] = []
+        self.checkpoint_extra: dict[str, Any] = {}
+        if checkpoint_mapping is not None:
+            self.checkpoint_extra[_FDP_MAPPING_CHECKPOINT_KEY] = checkpoint_mapping
 
     def fetch_fdp_status(self) -> list[tuple[int, int]]:
         return self.status
+
+    def get_checkpoint_extra(self, key: str) -> Any | None:
+        return self.checkpoint_extra.get(key)
+
+    def set_checkpoint_extra(self, key: str, value: Any | None) -> None:
+        if value is None:
+            self.checkpoint_extra.pop(key, None)
+        else:
+            self.checkpoint_extra[key] = value
 
     def report_status(self) -> dict:
         return {
@@ -165,6 +182,8 @@ def _make_fdp_config(
     placement_ids: list[int] | None = None,
     data_placement_policy: str | None = None,
     slot_reuse_policy: str | None = None,
+    mapping_recovery_enabled: bool = False,
+    load_checkpoint_on_init: bool = True,
     meta_checkpoint_placement_id: int | None = None,
 ) -> RawBlockL2AdapterConfig:
     return RawBlockL2AdapterConfig(
@@ -178,6 +197,7 @@ def _make_fdp_config(
         enable_zero_copy=False,
         meta_enable_periodic=False,
         meta_idle_quiet_ms=0,
+        load_checkpoint_on_init=load_checkpoint_on_init,
         io_engine="io_uring",
         use_uring_cmd=True,
         iouring_queue_depth=8,
@@ -185,6 +205,7 @@ def _make_fdp_config(
         fdp_placement_ids=placement_ids,
         fdp_data_placement_policy=data_placement_policy,
         fdp_slot_reuse_policy=slot_reuse_policy,
+        fdp_mapping_recovery_enabled=mapping_recovery_enabled,
         meta_checkpoint_placement_id=meta_checkpoint_placement_id,
         num_store_workers=1,
         num_lookup_workers=1,
@@ -202,6 +223,24 @@ def _make_fdp_adapter(
         return_value=fake_core,
     ):
         return RawBlockL2Adapter(config)
+
+
+def _make_fdp_mapping_checkpoint(
+    *,
+    policy: str = "cache_salt_prefix",
+    placement_status: list[list[int]] | None = None,
+    bucket_placements: list[list[object]] | None = None,
+    rank_placements: list[list[object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "policy": policy,
+        "placement_status": (
+            [[1, 11], [7, 17]] if placement_status is None else placement_status
+        ),
+        "bucket_placements": ([] if bucket_placements is None else bucket_placements),
+        "rank_placements": [] if rank_placements is None else rank_placements,
+    }
 
 
 def test_raw_block_meta_checkpoint_placement_id_reaches_core_config() -> None:
@@ -330,6 +369,52 @@ def test_raw_block_fdp_slot_reuse_policy_from_dict_reaches_core() -> None:
     assert config.to_core_config().fdp_slot_affinity_enabled is False
 
 
+def test_raw_block_fdp_mapping_recovery_defaults_to_disabled() -> None:
+    config = _make_fdp_config()
+
+    assert config.fdp_mapping_recovery_enabled is False
+
+
+def test_raw_block_fdp_mapping_recovery_from_dict_is_enabled() -> None:
+    config = RawBlockL2AdapterConfig.from_dict(
+        {
+            "device_path": "/dev/ng0n1",
+            "slot_bytes": RAW_BLOCK_CI_SLOT_BYTES,
+            "io_engine": "io_uring",
+            "use_uring_cmd": True,
+            "fdp_enabled": True,
+            "fdp_mapping_recovery_enabled": True,
+        }
+    )
+
+    assert config.fdp_mapping_recovery_enabled is True
+
+
+def test_raw_block_fdp_mapping_recovery_requires_fdp() -> None:
+    with pytest.raises(ValueError, match="requires fdp_enabled=true"):
+        RawBlockL2AdapterConfig(
+            device_path="/tmp/raw-block",
+            slot_bytes=RAW_BLOCK_CI_SLOT_BYTES,
+            fdp_mapping_recovery_enabled=True,
+        )
+
+
+def test_raw_block_fdp_mapping_recovery_requires_placement_policy() -> None:
+    with pytest.raises(ValueError, match="requires an FDP data placement policy"):
+        _make_fdp_config(
+            data_placement_policy="none",
+            mapping_recovery_enabled=True,
+        )
+
+
+def test_raw_block_fdp_mapping_recovery_requires_checkpoint_load() -> None:
+    with pytest.raises(ValueError, match="requires load_checkpoint_on_init=true"):
+        _make_fdp_config(
+            mapping_recovery_enabled=True,
+            load_checkpoint_on_init=False,
+        )
+
+
 def test_raw_block_fdp_from_dict_validates_enabled_id_elements() -> None:
     with pytest.raises(ValueError, match="fdp_placement_ids must contain"):
         RawBlockL2AdapterConfig.from_dict(
@@ -361,6 +446,120 @@ def test_raw_block_fdp_status_reports_registered_nonzero_ids() -> None:
         assert status["fdp_discovered_status"] == [(0, 10), (1, 11), (7, 17)]
         assert status["fdp_placement_ids"] == [1, 7]
         assert status["fdp_slot_reuse_policy"] == "pid_affinity"
+        assert status["fdp_mapping_recovery_enabled"] is False
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_mapping_recovery_restores_prefix_mapping() -> None:
+    checkpoint = _make_fdp_mapping_checkpoint(
+        bucket_placements=[["coding", 7]],
+    )
+    fake_core = _FakeFdpCore(
+        status=[(0, 10), (1, 11), (7, 17)],
+        checkpoint_mapping=checkpoint,
+    )
+    adapter = _make_fdp_adapter(
+        fake_core,
+        _make_fdp_config(mapping_recovery_enabled=True),
+    )
+    try:
+        status = adapter.report_status()
+        assert status["fdp_cache_salt_bucket_placements"] == {"coding": 7}
+
+        keys = [
+            make_object_key(1, cache_salt="coding:app"),
+            make_object_key(2, cache_salt="rag:app"),
+        ]
+        objects: list[Any] = [make_memory_obj(b"a"), make_memory_obj(b"b")]
+        task_id = adapter.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+        assert fake_core.put_many_calls == [[7, 1]]
+        persisted = fake_core.checkpoint_extra[_FDP_MAPPING_CHECKPOINT_KEY]
+        assert persisted["bucket_placements"] == [["coding", 7], ["rag", 1]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_mapping_recovery_rejects_all_on_ruhid_mismatch() -> None:
+    checkpoint = _make_fdp_mapping_checkpoint(
+        placement_status=[[1, 11], [7, 99]],
+        bucket_placements=[["chat", 1], ["rag", 7]],
+    )
+    fake_core = _FakeFdpCore(
+        status=[(0, 10), (1, 11), (7, 17)],
+        checkpoint_mapping=checkpoint,
+    )
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter.logger.warning"
+    ) as warning:
+        adapter = _make_fdp_adapter(
+            fake_core,
+            _make_fdp_config(mapping_recovery_enabled=True),
+        )
+    try:
+        status = adapter.report_status()
+        assert status["fdp_cache_salt_bucket_placements"] == {}
+        assert _FDP_MAPPING_CHECKPOINT_KEY not in fake_core.checkpoint_extra
+        assert any(
+            "complete FDP mapping" in call.args[0] for call in warning.call_args_list
+        )
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_mapping_recovery_restores_rank_mapping() -> None:
+    checkpoint = _make_fdp_mapping_checkpoint(
+        policy="cache_salt_rank",
+        rank_placements=[["rag", 0, 7]],
+    )
+    fake_core = _FakeFdpCore(
+        status=[(0, 10), (1, 11), (7, 17)],
+        checkpoint_mapping=checkpoint,
+    )
+    config = _make_fdp_config(
+        data_placement_policy="cache_salt_rank",
+        mapping_recovery_enabled=True,
+    )
+    with patch(
+        "lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter."
+        "_detect_node_gpu_count",
+        return_value=2,
+    ):
+        adapter = _make_fdp_adapter(fake_core, config)
+    try:
+        status = adapter.report_status()
+        assert status["fdp_cache_salt_rank_placements"] == {"rag": {0: 7}}
+
+        keys = [
+            make_object_key(1, cache_salt="rag:app", kv_rank=0),
+            make_object_key(2, cache_salt="rag:app", kv_rank=1),
+        ]
+        objects: list[Any] = [make_memory_obj(b"a"), make_memory_obj(b"b")]
+        task_id = adapter.submit_store_task(keys, objects)
+        assert wait_for_event_fd(adapter.get_store_event_fd())
+        assert adapter.pop_completed_store_tasks()[task_id].is_successful()
+
+        assert fake_core.put_many_calls == [[7, 1]]
+    finally:
+        adapter.close()
+
+
+def test_raw_block_fdp_mapping_recovery_disabled_clears_saved_mapping() -> None:
+    checkpoint = _make_fdp_mapping_checkpoint(
+        bucket_placements=[["coding", 7]],
+    )
+    fake_core = _FakeFdpCore(
+        status=[(0, 10), (1, 11), (7, 17)],
+        checkpoint_mapping=checkpoint,
+    )
+    adapter = _make_fdp_adapter(fake_core, _make_fdp_config())
+    try:
+        status = adapter.report_status()
+        assert status["fdp_cache_salt_bucket_placements"] == {}
+        assert _FDP_MAPPING_CHECKPOINT_KEY not in fake_core.checkpoint_extra
     finally:
         adapter.close()
 

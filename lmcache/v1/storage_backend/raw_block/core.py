@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
+import copy
 import ctypes
 import json
 import os
@@ -385,6 +386,7 @@ class RawBlockCore:
         self._meta_seq: int = 0
         self._meta_dirty_total: int = 0
         self._meta_persisted: int = 0
+        self._checkpoint_extra: dict[str, Any] = {}
         self._inflight_io_count: int = 0
         self._last_io_ts: float = time.monotonic()
         self._meta_stop_evt = threading.Event()
@@ -1003,6 +1005,41 @@ class RawBlockCore:
     def checkpoint_now(self) -> None:
         """Synchronously write a metadata checkpoint."""
         self._checkpoint_once(force=True)
+
+    def get_checkpoint_extra(self, key: str) -> Any | None:
+        """Return one extra checkpoint value.
+
+        Args:
+            key: Key within the checkpoint ``extra`` object.
+
+        Returns:
+            The stored value, or None when the key is absent.
+        """
+        with self._lock:
+            return self._checkpoint_extra.get(key)
+
+    def set_checkpoint_extra(self, key: str, value: Any | None) -> None:
+        """Set or remove one extra value in future checkpoints.
+
+        Args:
+            key: Key within the checkpoint ``extra`` object.
+            value: Value to store. None removes the key.
+
+        Raises:
+            RuntimeError: If the core is closed.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("RawBlockCore is closed")
+            if value is None:
+                if key not in self._checkpoint_extra:
+                    return
+                del self._checkpoint_extra[key]
+            else:
+                if self._checkpoint_extra.get(key) == value:
+                    return
+                self._checkpoint_extra[key] = value
+            self._meta_dirty_total += 1
 
     def apply_loaded_state(self, data: dict[str, Any]) -> bool:
         """Validate and apply a recovered metadata checkpoint payload.
@@ -1813,6 +1850,7 @@ class RawBlockCore:
                 "meta_version": self.meta_version,
                 "data_base_offset": self._data_base_offset,
                 "next_slot": self._next_slot,
+                "extra": copy.deepcopy(self._checkpoint_extra),
                 "entries": {
                     encoded_key: {
                         "offset": entry.offset,
@@ -1983,6 +2021,15 @@ class RawBlockCore:
             self._slot_placement_ids.clear()
             self._index.clear()
             self._lock_refcnt.clear()
+
+            extra = data.get("extra", {})
+            if isinstance(extra, dict):
+                self._checkpoint_extra = copy.deepcopy(extra)
+            else:
+                logger.warning(
+                    "Device metadata extra values are invalid; ignoring them"
+                )
+                self._checkpoint_extra = {}
 
             entries = data.get("entries", {})
             if isinstance(entries, dict):

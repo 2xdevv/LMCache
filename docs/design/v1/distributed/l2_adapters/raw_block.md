@@ -64,11 +64,13 @@ mapping is availability-first: if the number of buckets exceeds the number of
 registered data placement identifiers, extra buckets fall back to no directive
 and the adapter emits one warning. Status reporting tracks a fallback count and
 a bounded bucket sample rather than retaining all fallback bucket names. Empty
-`cache_salt` values also omit the directive. The mapping is process-local and
-may change after restart; read correctness is unaffected because `cache_salt` is
-part of the object key rather than the read path's FDP directive. Metadata
-checkpoint writes can use an explicit configured placement identifier while
-defaulting to no directive when unset. User-facing FDP configuration rules live in
+`cache_salt` values also omit the directive. By default the mapping is
+process-local and may change after restart; read correctness is unaffected
+because `cache_salt` is part of the object key rather than the read path's FDP
+directive. `fdp_mapping_recovery_enabled=true` instead stores the complete
+mapping in the checkpoint's optional `extra` values. Metadata checkpoint writes
+can use an explicit configured placement identifier while defaulting to no
+directive when unset. User-facing FDP configuration rules live in
 `docs/source/mp/l2_storage/raw_block.rst`; low-level NVMe command encoding
 details live in `rust/raw_block/README.md`.
 
@@ -77,9 +79,8 @@ slot's latest placement identifier in memory and prefers a matching slot during
 reuse. If no matching slot is available, it falls back to another free slot or
 allocates a new slot.
 
-Slot affinity is not checkpointed because FDP placement assignments are
-process-local. After recovery, free slots have no recorded affinity until they
-are reused.
+Slot affinity remains runtime-only even when logical FDP mappings are recovered.
+After recovery, free slots have no recorded affinity until they are reused.
 
 ## Key Design Choice
 
@@ -137,7 +138,11 @@ Rules:
 - recovery by loading the latest durable checkpoint and rebuilding the in-memory
   index
 
-The on-device format is intentionally unchanged by the MP adapter work.
+The checkpoint JSON supports optional `extra` values, with FDP mappings stored
+under `fdp_mapping`. When recovery is enabled, the adapter compares the saved
+mapping with the live PID-to-RUHID status and restores all assignments only when
+they remain compatible. Rejection affects only the FDP mapping, not the recovered
+raw-cache index. Older checkpoints without `extra` remain compatible.
 
 Recovered keys are exposed to the shared L2 eviction policy on adapter startup,
 so reclaimed slots come from global L2 eviction or explicit `delete()` calls.
@@ -181,6 +186,9 @@ Important validation rules:
 - `per_tp_device_paths` is rejected in MP mode
 - `load_checkpoint_on_init=false` starts with an empty in-memory index instead
   of loading the latest on-device metadata checkpoint
+- `fdp_mapping_recovery_enabled=true` requires FDP, checkpoint loading, and a
+  bucket/rank data-placement policy; the default `false` preserves process-local
+  assignment behavior
 - with `use_odirect=true`, MP L1 alignment must satisfy
   `l1_align_bytes >= block_align`
 - with `use_odirect=true`, raw-block I/O rejects offsets and total I/O lengths

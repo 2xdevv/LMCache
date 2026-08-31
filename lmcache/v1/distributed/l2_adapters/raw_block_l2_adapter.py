@@ -77,6 +77,8 @@ _FDP_SLOT_REUSE_POLICIES = frozenset(
 )
 _FDP_CACHE_SALT_BUCKET_SEPARATOR = ":"
 _FDP_CACHE_SALT_FALLBACK_BUCKET_SAMPLE_LIMIT = 64
+_FDP_MAPPING_CHECKPOINT_KEY = "fdp_mapping"
+_FDP_MAPPING_CHECKPOINT_VERSION = 1
 
 
 def _normalize_fdp_placement_ids(
@@ -239,6 +241,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         fdp_placement_ids: Optional[list[int]] = None,
         fdp_data_placement_policy: str | None = None,
         fdp_slot_reuse_policy: str | None = None,
+        fdp_mapping_recovery_enabled: bool = False,
         meta_checkpoint_placement_id: int | None = None,
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
@@ -281,6 +284,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
                 before falling back to the global free-slot pool. ``None``
                 defaults to ``"pid_affinity"`` when FDP is enabled and ``"none"``
                 otherwise.
+            fdp_mapping_recovery_enabled: Persist and recover the FDP
+                bucket/rank-to-placement mapping through raw-block checkpoints.
+                Recovery is disabled by default.
             meta_checkpoint_placement_id: Optional non-zero placement identifier
                 for metadata checkpoint writes.
             num_store_workers: Number of store worker threads.
@@ -330,6 +336,20 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             fdp_slot_reuse_policy,
             fdp_enabled=self.fdp_enabled,
         )
+        self.fdp_mapping_recovery_enabled = bool(fdp_mapping_recovery_enabled)
+        if self.fdp_mapping_recovery_enabled:
+            if not self.fdp_enabled:
+                raise ValueError(
+                    "fdp_mapping_recovery_enabled requires fdp_enabled=true"
+                )
+            if self.fdp_data_placement_policy == _FDP_DATA_PLACEMENT_POLICY_NONE:
+                raise ValueError(
+                    "fdp_mapping_recovery_enabled requires an FDP data placement policy"
+                )
+            if not self.load_checkpoint_on_init:
+                raise ValueError(
+                    "fdp_mapping_recovery_enabled requires load_checkpoint_on_init=true"
+                )
         if meta_checkpoint_placement_id is not None and (
             self.io_engine != "io_uring" or not self.use_uring_cmd
         ):
@@ -391,6 +411,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         fdp_placement_ids = raw_fdp_placement_ids if fdp_enabled else None
         fdp_data_placement_policy = d.get("fdp_data_placement_policy")
         fdp_slot_reuse_policy = d.get("fdp_slot_reuse_policy")
+        fdp_mapping_recovery_enabled = bool(
+            d.get("fdp_mapping_recovery_enabled", False)
+        )
 
         if block_align <= 0 or (block_align & (block_align - 1)) != 0:
             raise ValueError(f"block_align must be a power of 2, got {block_align}")
@@ -457,6 +480,7 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             fdp_placement_ids=fdp_placement_ids,
             fdp_data_placement_policy=fdp_data_placement_policy,
             fdp_slot_reuse_policy=fdp_slot_reuse_policy,
+            fdp_mapping_recovery_enabled=fdp_mapping_recovery_enabled,
             meta_checkpoint_placement_id=meta_checkpoint_placement_id,
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
@@ -512,6 +536,9 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "fdp_enabled=true\n"
             "- fdp_slot_reuse_policy (str): none or pid_affinity; defaults to "
             "pid_affinity when fdp_enabled=true\n"
+            "- fdp_mapping_recovery_enabled (bool): persist and atomically "
+            "recover FDP bucket/rank placement mappings from raw-block "
+            "checkpoints (default false)\n"
             "- meta_checkpoint_placement_id (int): non-zero FDP placement "
             "identifier for metadata checkpoints; requires io_uring_cmd\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
@@ -591,9 +618,14 @@ class RawBlockL2Adapter(L2AdapterInterface):
         self._store_pool: ThreadPoolExecutor
         self._lookup_pool: ThreadPoolExecutor
         self._load_pool: ThreadPoolExecutor
+
         self._fdp_lock = threading.Lock()
+        self._fdp_enabled = bool(config.fdp_enabled)
         self._fdp_data_placement_policy = config.fdp_data_placement_policy
         self._fdp_slot_reuse_policy = config.fdp_slot_reuse_policy
+        self._fdp_mapping_recovery_enabled = bool(config.fdp_mapping_recovery_enabled)
+        self._fdp_discovered_status: list[tuple[int, int]] = []
+        self._fdp_placement_ids: list[int] = []
         self._fdp_cache_salt_bucket_placements: dict[str, int] = {}
         self._fdp_cache_salt_rank_placements: dict[str, dict[int, int]] = {}
         self._fdp_cache_salt_rank_fallback_buckets: set[str] = set()
@@ -604,11 +636,15 @@ class RawBlockL2Adapter(L2AdapterInterface):
 
         try:
             self._core = RawBlockCore(config.to_core_config(), key_namespace="object")
-            self._fdp_enabled = bool(config.fdp_enabled)
-            self._fdp_discovered_status: list[tuple[int, int]] = []
-            self._fdp_placement_ids: list[int] = []
+            if not self._fdp_mapping_recovery_enabled:
+                self._core.set_checkpoint_extra(
+                    _FDP_MAPPING_CHECKPOINT_KEY,
+                    None,
+                )
             if self._fdp_enabled:
                 self._configure_fdp(config.fdp_placement_ids)
+            if self._fdp_mapping_recovery_enabled:
+                self._recover_fdp_mapping()
             if config.io_engine == "io_uring":
                 logger.warning(
                     "RawBlockL2Adapter: MP raw_block uses io_uring without "
@@ -884,6 +920,7 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 "fdp_placement_ids": list(self._fdp_placement_ids),
                 "fdp_data_placement_policy": self._fdp_data_placement_policy,
                 "fdp_slot_reuse_policy": self._fdp_slot_reuse_policy,
+                "fdp_mapping_recovery_enabled": (self._fdp_mapping_recovery_enabled),
                 "fdp_cache_salt_bucket_separator": _FDP_CACHE_SALT_BUCKET_SEPARATOR,
                 "fdp_cache_salt_bucket_placements": (fdp_cache_salt_bucket_placements),
                 "fdp_cache_salt_rank_placements": fdp_cache_salt_rank_placements,
@@ -957,6 +994,107 @@ class RawBlockL2Adapter(L2AdapterInterface):
         logger.info(
             "RawBlockL2Adapter registered FDP placement identifiers: %s",
             self._fdp_placement_ids,
+        )
+
+    def _recover_fdp_mapping(self) -> None:
+        """Atomically restore or reject the saved FDP mapping."""
+        candidate = self._core.get_checkpoint_extra(_FDP_MAPPING_CHECKPOINT_KEY)
+        if candidate is None:
+            return
+
+        try:
+            bucket_placements, rank_placements = self._validate_fdp_mapping_checkpoint(
+                candidate
+            )
+        except (TypeError, ValueError) as e:
+            self._core.set_checkpoint_extra(
+                _FDP_MAPPING_CHECKPOINT_KEY,
+                None,
+            )
+            logger.warning(
+                "RawBlockL2Adapter rejected the complete FDP mapping checkpoint: %s",
+                e,
+            )
+            return
+
+        with self._fdp_lock:
+            self._fdp_cache_salt_bucket_placements = bucket_placements
+            self._fdp_cache_salt_rank_placements = rank_placements
+            recovered_count = len(bucket_placements) + sum(
+                len(placements) for placements in rank_placements.values()
+            )
+            self._persist_fdp_mapping_locked()
+
+        logger.info(
+            "RawBlockL2Adapter recovered %d FDP placement assignments",
+            recovered_count,
+        )
+
+    def _validate_fdp_mapping_checkpoint(
+        self,
+        candidate: Any,
+    ) -> tuple[dict[str, int], dict[str, dict[int, int]]]:
+        """Validate the complete saved FDP mapping without applying it."""
+        if not isinstance(candidate, dict):
+            raise ValueError("mapping checkpoint must be an object")
+        if candidate.get("version") != _FDP_MAPPING_CHECKPOINT_VERSION:
+            raise ValueError("mapping checkpoint version is unsupported")
+        if candidate.get("policy") != self._fdp_data_placement_policy:
+            raise ValueError("data placement policy changed")
+
+        saved_status = dict(candidate.get("placement_status", []))
+        current_status = dict(self._fdp_discovered_status)
+        current_placement_ids = set(self._fdp_placement_ids)
+        expected_status = {
+            placement_id: current_status[placement_id]
+            for placement_id in self._fdp_placement_ids
+        }
+        if saved_status != expected_status:
+            raise ValueError("placement identifier or reclaim-unit mapping changed")
+
+        bucket_placements = dict(candidate.get("bucket_placements", []))
+        rank_placements: dict[str, dict[int, int]] = {}
+        for bucket, rank, placement_id in candidate.get("rank_placements", []):
+            rank_placements.setdefault(bucket, {})[rank] = placement_id
+
+        assigned_placement_ids = set(bucket_placements.values())
+        assigned_placement_ids.update(
+            placement_id
+            for placements in rank_placements.values()
+            for placement_id in placements.values()
+        )
+        if not assigned_placement_ids.issubset(current_placement_ids):
+            raise ValueError("an assignment uses an unavailable placement identifier")
+
+        return bucket_placements, rank_placements
+
+    def _persist_fdp_mapping_locked(self) -> None:
+        """Publish the current FDP mapping to the core checkpoint state."""
+        if not self._fdp_mapping_recovery_enabled:
+            return
+        current_status = dict(self._fdp_discovered_status)
+        checkpoint = {
+            "version": _FDP_MAPPING_CHECKPOINT_VERSION,
+            "policy": self._fdp_data_placement_policy,
+            "placement_status": [
+                [placement_id, current_status[placement_id]]
+                for placement_id in self._fdp_placement_ids
+            ],
+            "bucket_placements": [
+                [bucket, placement_id]
+                for bucket, placement_id in (
+                    self._fdp_cache_salt_bucket_placements.items()
+                )
+            ],
+            "rank_placements": [
+                [bucket, rank, placement_id]
+                for bucket, placements in (self._fdp_cache_salt_rank_placements.items())
+                for rank, placement_id in placements.items()
+            ],
+        }
+        self._core.set_checkpoint_extra(
+            _FDP_MAPPING_CHECKPOINT_KEY,
+            checkpoint,
         )
 
     def _raise_if_closed_locked(self) -> None:
@@ -1042,13 +1180,10 @@ class RawBlockL2Adapter(L2AdapterInterface):
             if placement_id is not None:
                 return placement_id
 
-            if len(self._fdp_cache_salt_bucket_placements) < len(
-                self._fdp_placement_ids
-            ):
-                placement_id = self._fdp_placement_ids[
-                    len(self._fdp_cache_salt_bucket_placements)
-                ]
+            placement_id = self._next_available_fdp_placement_id_locked()
+            if placement_id is not None:
                 self._fdp_cache_salt_bucket_placements[bucket] = placement_id
+                self._persist_fdp_mapping_locked()
                 logger.info(
                     "RawBlockL2Adapter assigned FDP placement identifier %d "
                     "to cache_salt bucket %r",
@@ -1109,10 +1244,13 @@ class RawBlockL2Adapter(L2AdapterInterface):
                 self._emit_fdp_exhausted_warning_locked()
                 return None
 
-            placement_id = self._fdp_placement_ids[
-                self._fdp_assigned_rank_placement_count_locked()
-            ]
+            placement_id = self._next_available_fdp_placement_id_locked()
+            if placement_id is None:
+                raise RuntimeError(
+                    "raw_block FDP placement identifier availability changed"
+                )
             rank_placements[rank] = placement_id
+            self._persist_fdp_mapping_locked()
             logger.info(
                 "RawBlockL2Adapter assigned FDP placement identifier %d to "
                 "cache_salt bucket %r rank %d",
@@ -1122,17 +1260,25 @@ class RawBlockL2Adapter(L2AdapterInterface):
             )
             return placement_id
 
-    def _fdp_assigned_rank_placement_count_locked(self) -> int:
-        """Return assigned cache_salt_rank placement count under FDP lock."""
-        return sum(
-            len(rank_placements)
-            for rank_placements in self._fdp_cache_salt_rank_placements.values()
-        )
-
     def _has_available_fdp_placement_id_locked(self) -> bool:
         """Return whether cache_salt_rank can allocate another placement ID."""
-        return self._fdp_assigned_rank_placement_count_locked() < len(
-            self._fdp_placement_ids
+        return self._next_available_fdp_placement_id_locked() is not None
+
+    def _next_available_fdp_placement_id_locked(self) -> int | None:
+        """Return the first configured placement ID not already assigned."""
+        assigned = set(self._fdp_cache_salt_bucket_placements.values())
+        assigned.update(
+            placement_id
+            for placements in self._fdp_cache_salt_rank_placements.values()
+            for placement_id in placements.values()
+        )
+        return next(
+            (
+                placement_id
+                for placement_id in self._fdp_placement_ids
+                if placement_id not in assigned
+            ),
+            None,
         )
 
     def _emit_fdp_exhausted_warning_locked(self) -> None:

@@ -280,6 +280,31 @@ def test_raw_block_core_recovers_checkpoint_from_temp_file(tmp_path):
         recovered.close()
 
 
+def test_raw_block_core_recovers_checkpoint_extra(tmp_path) -> None:
+    path = make_raw_block_file(tmp_path)
+    config = make_raw_block_core_config(path)
+    value = {
+        "version": 1,
+        "placements": [["rag", 7]],
+    }
+
+    core = RawBlockCore(config, key_namespace="object")
+    try:
+        core.set_checkpoint_extra("test", value)
+        core.checkpoint_now()
+    finally:
+        core.close()
+
+    recovered = RawBlockCore(config, key_namespace="object")
+    try:
+        assert recovered.get_checkpoint_extra("test") == {
+            "version": 1,
+            "placements": [["rag", 7]],
+        }
+    finally:
+        recovered.close()
+
+
 def test_raw_block_core_rebuilds_missing_free_slots_from_checkpoint(tmp_path):
     path = make_raw_block_file(tmp_path)
     config = make_raw_block_core_config(path)
