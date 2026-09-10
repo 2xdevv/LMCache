@@ -33,6 +33,62 @@ use io_uring::squeue::{Entry as SqueueEntry, Entry128};
 use io_uring::types::Fd;
 use io_uring::{opcode, IoUring};
 
+// Prepare every part before publishing any work to the I/O worker. A split read
+// shares one completion, so callers retain their buffers until both parts finish.
+fn prepare_uring_read(
+    mut sub: IoSubmission,
+    capacity: usize,
+    payload_len: usize,
+    alignment: usize,
+    needs_align: bool,
+    fixed_buffer: Option<(u16, usize)>,
+) -> PyResult<Vec<IoSubmission>> {
+    let ptr_aligned = !needs_align || sub.ptr_addr.is_multiple_of(alignment);
+    if ptr_aligned && capacity >= sub.len {
+        sub.fixed_buffer_idx = fixed_buffer
+            .filter(|(_, size)| *size >= sub.len)
+            .map(|(index, _)| index);
+        return Ok(vec![sub]);
+    }
+
+    // Keep NVMe command handling unchanged. For ordinary O_DIRECT reads, an
+    // aligned destination can receive its full-block prefix without a copy.
+    let prefix = if ptr_aligned && needs_align && sub.nvme_cmd_data.is_none() {
+        payload_len / alignment * alignment
+    } else {
+        0
+    };
+    let tail_offset = sub
+        .offset
+        .checked_add(prefix as u64)
+        .ok_or_else(|| PyValueError::new_err("offset overflow"))?;
+    let tail_dst = sub
+        .ptr_addr
+        .checked_add(prefix)
+        .ok_or_else(|| PyValueError::new_err("buffer address overflow"))?;
+    let bounce = Arc::new(AlignedBuf::new(sub.len - prefix, alignment)?);
+    if prefix > 0 {
+        sub.completion = Arc::new(IoCompletion::with_pending(2));
+    }
+    let mut tail = sub.clone();
+    tail.offset = tail_offset;
+    tail.len -= prefix;
+    tail.ptr_addr = bounce.as_mut_ptr() as usize;
+    tail.fixed_buffer_idx = None;
+    tail.bounce = Some(bounce);
+    tail.original_ptr = Some(tail_dst);
+    tail.payload_len = Some(payload_len - prefix);
+
+    if prefix == 0 {
+        return Ok(vec![tail]);
+    }
+    sub.len = prefix;
+    sub.fixed_buffer_idx = fixed_buffer
+        .filter(|(_, size)| *size >= prefix)
+        .map(|(index, _)| index);
+    Ok(vec![sub, tail])
+}
+
 // Wrapper enum to support both standard and big io_uring entries
 // This allows fallback to standard entries on kernels < 5.19
 #[derive(Clone)]
@@ -42,6 +98,28 @@ enum IoUringWrapper {
 }
 
 impl IoUringWrapper {
+    // The kernel keeps excess CQEs on an overflow list. After draining the CQ,
+    // enter the ring to move those entries back before waiting on eventfd.
+    fn flush_completion_overflow(&self) -> io::Result<bool> {
+        match self {
+            IoUringWrapper::Standard(ring) => {
+                let mut ring = ring.lock().unwrap();
+                if !ring.submission().cq_overflow() {
+                    return Ok(false);
+                }
+                ring.submitter().submit_and_wait(0)?;
+            }
+            IoUringWrapper::Big(ring) => {
+                let mut ring = ring.lock().unwrap();
+                if !ring.submission().cq_overflow() {
+                    return Ok(false);
+                }
+                ring.submitter().submit_and_wait(0)?;
+            }
+        }
+        Ok(true)
+    }
+
     // Get the submission queue length
     fn submission_len(&self) -> usize {
         match self {
@@ -572,6 +650,39 @@ mod tests {
         assert!(placement_id_to_u16(-1).is_err());
         assert!(placement_id_to_u16(65536).is_err());
     }
+
+    #[test]
+    fn split_completion_waits_for_every_part() {
+        let completion = Arc::new(IoCompletion::with_pending(2));
+        let waiter_completion = Arc::clone(&completion);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            sender.send(waiter_completion.wait().is_ok()).unwrap();
+        });
+        completion.set(Ok(()));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        completion.set(Ok(()));
+        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn split_completion_preserves_failure_in_either_order() {
+        for fail_first in [false, true] {
+            let completion = IoCompletion::with_pending(2);
+            for part in 0..2 {
+                completion.set(if (part == 0) == fail_first {
+                    Err(PyRuntimeError::new_err("read part failed"))
+                } else {
+                    Ok(())
+                });
+            }
+            assert!(completion.wait().is_err());
+        }
+    }
 }
 
 /// Prepare NVMe uring command for read/write operations
@@ -761,38 +872,51 @@ fn release_pybuffer(mut view: pyo3::ffi::Py_buffer) {
 /// Fields:
 /// - `result`: Stores the completion status (Ok or Err)
 /// - `cvar`: Condition variable for signaling when result is available
+/// - `pending`: Parts that must settle before the caller can reuse its buffer
 struct IoCompletion {
     result: Mutex<Option<PyResult<()>>>,
     cvar: Condvar,
+    pending: AtomicU64,
 }
 
 impl IoCompletion {
     fn new() -> Self {
-        Self {
-            result: Mutex::new(None),
-            cvar: Condvar::new(),
-        }
+        Self::with_pending(1)
     }
     fn set(&self, r: PyResult<()>) {
         let mut guard = self
             .result
             .lock()
             .expect("IoCompletion: mutex poisoned in set()");
-        *guard = Some(r);
-        self.cvar.notify_one();
+        // Preserve a failure from either part, but keep waiting for every part
+        // before allowing the caller to release or reuse its destination.
+        if !matches!(guard.as_ref(), Some(Err(_))) {
+            *guard = Some(r);
+        }
+        if self.pending.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.cvar.notify_one();
+        }
     }
     fn wait(&self) -> PyResult<()> {
         let mut guard = self
             .result
             .lock()
             .expect("IoCompletion: mutex poisoned in wait()");
-        while guard.is_none() {
+        while self.pending.load(Ordering::Relaxed) > 0 {
             guard = self
                 .cvar
                 .wait(guard)
                 .expect("IoCompletion: condition variable wait failed");
         }
         guard.take().unwrap()
+    }
+
+    fn with_pending(pending: u64) -> Self {
+        Self {
+            result: Mutex::new(None),
+            cvar: Condvar::new(),
+            pending: AtomicU64::new(pending),
+        }
     }
 }
 
@@ -1706,6 +1830,24 @@ impl RawBlockDevice {
                             ring_clone.submission_sync();
                         }
 
+                        match ring_clone.flush_completion_overflow() {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(error)
+                                if matches!(
+                                    error.raw_os_error(),
+                                    Some(libc::EBUSY) | Some(libc::EINTR) | Some(libc::EAGAIN)
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!("io_uring completion overflow flush failed: {error}");
+                                shutdown_clone.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+
                         // Block on epoll only if there's truly nothing pending. The empty +
                         // shutdown checks short-circuit so we don't sleep when a producer or
                         // do_close() already left work for us. Race-free against a late
@@ -2492,7 +2634,10 @@ impl RawBlockDevice {
         Ok(results)
     }
 
-    /// Synchronous read using io_uring.
+    /// Read `total_len` device bytes and expose `payload_len` bytes to `data`.
+    /// The writable buffer must fit the payload. Ordinary O_DIRECT reads use an
+    /// aligned destination directly and bounce only a padded tail that does not
+    /// fit. This method waits for every submitted part and propagates I/O errors.
     #[pyo3(signature = (offset, data, payload_len, total_len = None))]
     fn read_uring(
         &self,
@@ -2547,86 +2692,48 @@ impl RawBlockDevice {
             }
         }
 
-        // O_DIRECT and NVMe io_uring_cmd both require a page-aligned ptr for
-        // multi-page transfers (kernel / PRP list entries).
-        let needs_align = self.use_odirect || self.use_uring_cmd;
-        let ptr_aligned = if needs_align {
-            (ptr as usize).is_multiple_of(align)
-        } else {
-            true
-        };
-
-        // Fixed buffers are pre-registered with io_uring, enabling true zero-copy I/O
-        let use_fixed = self.fixed_buffers_registered.load(Ordering::Relaxed);
-        let fixed_idx = if use_fixed && ptr_aligned {
-            let map = self.fixed_buffer_map.lock().unwrap();
-            let ptr_addr = ptr as usize;
-            map.get(&ptr_addr).map(|(idx, _)| *idx)
-        } else {
-            None
-        };
-
-        // Use bounce buffer if:
-        // Buffer is not aligned (O_DIRECT or io_uring_cmd PRP requirement)
-        // Buffer capacity is less than total_len
-        let use_bounce = !ptr_aligned || cap < total_len;
-
-        let res = if !use_bounce {
-            self.in_flight_count.fetch_add(1, Ordering::Relaxed);
-            let comp = Arc::new(IoCompletion::new());
+        // Keep preparation inside the closure so the Python view is also
+        // released on allocation or NVMe-command preparation errors.
+        let res = (|| {
+            let fixed_buffer = if self.fixed_buffers_registered.load(Ordering::Relaxed) {
+                self.fixed_buffer_map
+                    .lock()
+                    .unwrap()
+                    .get(&(ptr as usize))
+                    .copied()
+            } else {
+                None
+            };
             let sub = IoSubmission {
                 fd: self.fd,
                 offset,
                 len: total_len,
                 ptr_addr: ptr as usize,
                 is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: fixed_idx,
-                bounce: None,
-                original_ptr: None,
-                payload_len: None,
-                batch_id: 0,
                 nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
+                ..IoSubmission::default()
             };
+            let submissions = prepare_uring_read(
+                sub,
+                cap,
+                payload_len,
+                align,
+                self.use_odirect || self.use_uring_cmd,
+                fixed_buffer,
+            )?;
+            let comp = Arc::clone(&submissions[0].completion);
+            self.in_flight_count
+                .fetch_add(submissions.len() as u64, Ordering::Relaxed);
             {
                 let q = self.queue.as_ref().expect("queue must exist");
                 let mut q = q.lock().unwrap();
-                q.push(sub);
+                q.extend(submissions);
             }
             if let Some(batch_ready) = &self.batch_ready {
                 batch_ready.signal_producer();
             }
             py.allow_threads(move || comp.wait())
-        } else {
-            let bounce = AlignedBuf::new(total_len, align)?;
-            let bounce_arc = std::sync::Arc::new(bounce);
-            let bounce_ptr = bounce_arc.as_mut_ptr();
-            self.in_flight_count.fetch_add(1, Ordering::Relaxed);
-            let comp = Arc::new(IoCompletion::new());
-            let sub = IoSubmission {
-                fd: self.fd,
-                offset,
-                len: total_len,
-                ptr_addr: bounce_ptr as usize,
-                is_write: false,
-                completion: comp.clone(),
-                fixed_buffer_idx: None,
-                bounce: Some(bounce_arc),
-                original_ptr: Some(ptr as usize),
-                payload_len: Some(payload_len),
-                batch_id: 0,
-                nvme_cmd_data: self._build_nvme_cmd_data(0, 0)?,
-            };
-            {
-                let q = self.queue.as_ref().expect("queue must exist");
-                let mut q = q.lock().unwrap();
-                q.push(sub);
-            }
-            if let Some(batch_ready) = &self.batch_ready {
-                batch_ready.signal_producer();
-            }
-            py.allow_threads(move || comp.wait())
-        };
+        })();
 
         release_pybuffer(view);
         res?;
@@ -2784,6 +2891,9 @@ impl RawBlockDevice {
     /// Batched read: submit multiple reads at once via io_uring.
     /// All reads are queued to the worker thread, which processes them
     /// in batches to maximize throughput.
+    /// Each buffer receives up to `min(capacity, total_len)` bytes. Aligned
+    /// ordinary O_DIRECT destinations bounce only a tail that does not fit;
+    /// split reads still produce one result per input buffer.
     ///
     /// Returns a batch ID that must be passed to `wait_iouring()` to wait for
     /// completion and obtain a success bitmap plus sparse completion errors.
@@ -2894,9 +3004,10 @@ impl RawBlockDevice {
 
         // Release the GIL while submitting I/O operations
         let res = py.allow_threads(move || {
-            let mut submissions: Vec<(IoSubmission, Arc<IoCompletion>)> = Vec::with_capacity(n);
+            let mut submissions = Vec::with_capacity(n);
+            let mut logical_completions = Vec::with_capacity(n);
 
-            // Per-item bounce decision mirrors `read_uring`.
+            // Per-item preparation is shared with `read_uring`.
             let needs_align = use_odirect || use_uring_cmd;
             for i in 0..n {
                 let total_len = total_lens[i];
@@ -2922,80 +3033,44 @@ impl RawBlockDevice {
                     )));
                 }
 
-                let ptr_aligned = if needs_align {
-                    ptrs[i].is_multiple_of(alignment)
-                } else {
-                    true
-                };
-                let use_bounce = !ptr_aligned || cap < total_len;
-
-                let comp = Arc::new(IoCompletion::new());
-
-                let (ptr_addr, fixed_idx, bounce_opt, original_ptr_opt, payload_len_opt) =
-                    if use_bounce {
-                        let bounce = AlignedBuf::new(total_len, alignment)?;
-                        let bounce_arc = Arc::new(bounce);
-                        let bounce_ptr = bounce_arc.as_mut_ptr() as usize;
-                        // Copy-back bounded by caller capacity.
-                        let payload_len = std::cmp::min(cap, total_len);
-                        (
-                            bounce_ptr,
-                            None,
-                            Some(bounce_arc),
-                            Some(ptrs[i]),
-                            Some(payload_len),
-                        )
-                    } else {
-                        // Fixed buffers are pre-registered with io_uring,
-                        // enabling true zero-copy I/O.
-                        let fixed_idx = fixed_buffer_map.get(&ptrs[i]).map(|(idx, _)| *idx);
-                        (ptrs[i], fixed_idx, None, None, None)
-                    };
-
                 let sub = IoSubmission {
                     fd,
                     offset,
                     len: total_len,
-                    ptr_addr,
+                    ptr_addr: ptrs[i],
                     is_write: false, // read operation
-                    completion: comp.clone(),
-                    fixed_buffer_idx: fixed_idx,
-                    bounce: bounce_opt,
-                    original_ptr: original_ptr_opt,
-                    payload_len: payload_len_opt,
                     batch_id,
                     nvme_cmd_data: nvme_cmd_data.clone(),
+                    ..IoSubmission::default()
                 };
-
-                submissions.push((sub, comp));
+                let parts = prepare_uring_read(
+                    sub,
+                    cap,
+                    cap.min(total_len),
+                    alignment,
+                    needs_align,
+                    fixed_buffer_map.get(&ptrs[i]).copied(),
+                )?;
+                logical_completions.push(Arc::clone(&parts[0].completion));
+                submissions.extend(parts);
             }
 
-            // Queue all submissions atomically. At this point no further errors can
-            // occur during queuing.
-            for (sub, comp) in submissions {
-                in_flight_count.fetch_add(1, Ordering::Relaxed);
-
-                // Increment per-batch in-flight count
-                {
-                    let batch_map = batch_in_flight.lock().unwrap();
-                    if let Some((batch_count, _)) = batch_map.get(&batch_id) {
-                        batch_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                {
-                    let mut q = queue.lock().unwrap();
-                    q.push(sub);
-                }
-                batch_ready.signal_producer();
-
-                // Store completion for error checking in wait_iouring
-                {
-                    let mut completions = batched_completions.lock().unwrap();
-                    let batch_completions = completions.entry(batch_id).or_default();
-                    batch_completions.push(comp);
+            // Publish counts and one completion per logical request before the
+            // worker can observe any of the physical prefix/tail submissions.
+            let count = submissions.len() as u64;
+            in_flight_count.fetch_add(count, Ordering::Relaxed);
+            {
+                let batch_map = batch_in_flight.lock().unwrap();
+                if let Some((batch_count, _)) = batch_map.get(&batch_id) {
+                    batch_count.fetch_add(count, Ordering::Relaxed);
                 }
             }
+            batched_completions
+                .lock()
+                .unwrap()
+                .insert(batch_id, logical_completions);
+            queue.lock().unwrap().extend(submissions);
+            batch_ready.signal_producer();
             Ok::<(), PyErr>(())
         });
 
