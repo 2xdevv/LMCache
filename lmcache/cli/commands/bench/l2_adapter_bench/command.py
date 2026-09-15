@@ -18,7 +18,6 @@ import sys
 if TYPE_CHECKING:
     # First Party
     from lmcache.cli.commands.base import BaseCommand
-    from lmcache.cli.commands.bench.l2_adapter_bench.result import BenchResult
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +472,12 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
                 num_keys=num_keys,
                 data_size=data_size,
                 rounds=total_rounds,
+                warmup_rounds=warmup,
                 keys_for_round=_build_round_keys,
                 objs_for_round=_store_objs,
                 log=log,
             )
-            results.append(_strip_warmup(all_store, warmup))
+            results.append(all_store)
             # Last measured store round is total_rounds - 1.
             last_store_round_keys = _build_round_keys(total_rounds - 1)
             log("")
@@ -490,12 +490,13 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
                 in_flight=in_flight,
                 num_keys=num_keys,
                 rounds=total_rounds,
+                warmup_rounds=warmup,
                 keys_for_round=_build_lookup_round_keys,
                 log=log,
                 expected_max_hit_rate=max_hit_rate,
                 expected_hit_count=expected_hit_count,
             )
-            results.append(_strip_warmup(all_lookup, warmup))
+            results.append(all_lookup)
             log("")
 
         # ---- Load ----
@@ -507,11 +508,12 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
                 num_keys=num_keys,
                 data_size=data_size,
                 rounds=total_rounds,
+                warmup_rounds=warmup,
                 keys_for_round=_build_round_keys,
                 objs_for_round=_load_objs,
                 log=log,
             )
-            results.append(_strip_warmup(all_load, warmup))
+            results.append(all_load)
             last_load_round_keys = _build_round_keys(total_rounds - 1)
             log("")
 
@@ -573,28 +575,6 @@ def run_l2_adapter_bench(command: "BaseCommand", args: argparse.Namespace) -> No
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _strip_warmup(result: "BenchResult", warmup: int) -> "BenchResult":
-    """Drop the leading *warmup* rounds from a BenchResult."""
-    # First Party
-    from lmcache.cli.commands.bench.l2_adapter_bench.result import BenchResult
-
-    # Adjust the expected hit count proportionally for the kept rounds.
-    kept_rounds = max(0, len(result.round_durations) - warmup)
-    total_rounds = max(1, len(result.round_durations))
-    scaled_expected_hit = int(result.expected_hit_count * kept_rounds / total_rounds)
-
-    return BenchResult(
-        operation=result.operation,
-        in_flight=result.in_flight,
-        num_keys=result.num_keys,
-        data_size_bytes=result.data_size_bytes,
-        round_durations=result.round_durations[warmup:],
-        success_counts=result.success_counts[warmup:],
-        expected_max_hit_rate=result.expected_max_hit_rate,
-        expected_hit_count=scaled_expected_hit,
-    )
 
 
 def _emit_l2_adapter_metrics(
