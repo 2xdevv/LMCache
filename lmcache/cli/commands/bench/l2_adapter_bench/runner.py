@@ -9,6 +9,9 @@ coroutine processes them.
 
 The benchmark itself is single-threaded on the producer side; the
 adapter internally is free to use threads / coroutines / async I/O.
+
+The first ``warmup_rounds`` of ``rounds`` run normally but are excluded
+from the returned statistics.
 """
 
 # Future
@@ -140,6 +143,8 @@ def bench_store(
     keys_for_round: KeyProvider,
     objs_for_round: ObjProvider,
     log: LogFn,
+    *,
+    warmup_rounds: int = 0,
 ) -> BenchResult:
     """Benchmark ``submit_store_task``.
 
@@ -182,12 +187,14 @@ def bench_store(
                 f"({len(completed)}/{len(task_ids)} tasks completed, "
                 f"success_keys={success_keys}/{in_flight * num_keys})"
             )
-            result.timed_out_rounds += 1
-            result.success_counts.append(success_keys)
+            if r >= warmup_rounds:
+                result.timed_out_rounds += 1
+                result.success_counts.append(success_keys)
             continue
 
-        result.round_durations.append(elapsed)
-        result.success_counts.append(success_keys)
+        if r >= warmup_rounds:
+            result.round_durations.append(elapsed)
+            result.success_counts.append(success_keys)
         log(
             f"  [Store] Round {r + 1}: {elapsed * 1000:.2f} ms, "
             f"success_keys={success_keys}/{in_flight * num_keys}"
@@ -210,6 +217,8 @@ def bench_lookup(
     log: LogFn,
     expected_max_hit_rate: float = 0.0,
     expected_hit_count: int = 0,
+    *,
+    warmup_rounds: int = 0,
 ) -> BenchResult:
     """Benchmark ``submit_lookup_and_lock_task``."""
     result = BenchResult(
@@ -252,12 +261,14 @@ def bench_lookup(
                 f"({len(results)}/{len(task_ids)} tasks completed, "
                 f"found={total_found}/{in_flight * num_keys})"
             )
-            result.timed_out_rounds += 1
-            result.success_counts.append(total_found)
+            if r >= warmup_rounds:
+                result.timed_out_rounds += 1
+                result.success_counts.append(total_found)
             continue
 
-        result.round_durations.append(elapsed)
-        result.success_counts.append(total_found)
+        if r >= warmup_rounds:
+            result.round_durations.append(elapsed)
+            result.success_counts.append(total_found)
         log(
             f"  [Lookup] Round {r + 1}: {elapsed * 1000:.2f} ms, "
             f"found={total_found}/{in_flight * num_keys}"
@@ -280,6 +291,8 @@ def bench_load(
     keys_for_round: KeyProvider,
     objs_for_round: ObjProvider,
     log: LogFn,
+    *,
+    warmup_rounds: int = 0,
 ) -> BenchResult:
     """Benchmark ``submit_load_task``."""
     result = BenchResult(
@@ -318,12 +331,14 @@ def bench_load(
                 f"({len(results)}/{len(task_ids)} tasks completed, "
                 f"loaded={total_loaded}/{in_flight * num_keys})"
             )
-            result.timed_out_rounds += 1
-            result.success_counts.append(total_loaded)
+            if r >= warmup_rounds:
+                result.timed_out_rounds += 1
+                result.success_counts.append(total_loaded)
             continue
 
-        result.round_durations.append(elapsed)
-        result.success_counts.append(total_loaded)
+        if r >= warmup_rounds:
+            result.round_durations.append(elapsed)
+            result.success_counts.append(total_loaded)
         log(
             f"  [Load] Round {r + 1}: {elapsed * 1000:.2f} ms, "
             f"loaded={total_loaded}/{in_flight * num_keys}"
