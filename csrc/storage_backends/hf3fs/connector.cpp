@@ -9,14 +9,68 @@
 #include <cstring>
 #include <functional>
 #include <limits.h>
+#include <optional>
 #include <stdexcept>
 #include <sstream>
 #include <thread>
+#include <utility>
 
 #include "../keys.h"
 
 namespace lmcache {
 namespace connector {
+
+namespace {
+
+/**
+ * An open file registered with 3FS for USRBIO.
+ *
+ * Opens the file and registers its fd via hf3fs_reg_fd on construction;
+ * deregisters and closes it on destruction. Move-only so a batch can keep
+ * many files registered while their I/Os are in the ring.
+ */
+class RegisteredFile {
+ public:
+  /**
+   * @param path File path
+   * @param for_write true opens O_WRONLY|O_CREAT, false opens O_RDONLY
+   * @throws std::runtime_error if open or hf3fs_reg_fd fails
+   */
+  RegisteredFile(const std::string& path, bool for_write) {
+    int flags = for_write ? (O_WRONLY | O_CREAT) : O_RDONLY;
+    fd_ = ::open(path.c_str(), flags, for_write ? 0644 : 0);
+    if (fd_ < 0) {
+      throw std::runtime_error("open failed: " + std::string(strerror(errno)));
+    }
+    int reg_result = hf3fs_reg_fd(fd_, 0);
+    if (reg_result > 0) {
+      ::close(fd_);
+      throw std::runtime_error(
+          "hf3fs_reg_fd failed: " + std::to_string(reg_result) +
+          " (errno=" + strerror(reg_result) + ")");
+    }
+  }
+
+  RegisteredFile(RegisteredFile&& other) noexcept
+      : fd_(std::exchange(other.fd_, -1)) {}
+  RegisteredFile& operator=(RegisteredFile&&) = delete;
+  RegisteredFile(const RegisteredFile&) = delete;
+  RegisteredFile& operator=(const RegisteredFile&) = delete;
+
+  ~RegisteredFile() {
+    if (fd_ >= 0) {
+      hf3fs_dereg_fd(fd_);
+      ::close(fd_);
+    }
+  }
+
+  int fd() const { return fd_; }
+
+ private:
+  int fd_ = -1;
+};
+
+}  // namespace
 
 /**
  * Construct a new Hf3fsConnector.
@@ -183,215 +237,47 @@ void Hf3fsConnector::init_write_iov(hf3fs_iov& iov) {
 }
 
 /**
- * Create a new per-thread connection.
- *
- * Initializes:
- * - Read Ior and Iov
- * - Write Ior and Iov
- * - File descriptors (initialized to -1)
+ * Create a new per-thread connection with its read and write rings.
  *
  * @return WorkerHf3fsConn Initialized connection structure
+ * @throws std::runtime_error if any Ior or Iov cannot be created
  */
 WorkerHf3fsConn Hf3fsConnector::create_connection() {
   WorkerHf3fsConn conn;
-
-  // Initialize read Ior
-  init_read_ior(conn.read_ior);
-  conn.read_ior_initialized = true;
-
-  // Initialize write Ior
-  init_write_ior(conn.write_ior);
-  conn.write_ior_initialized = true;
-
-  // Initialize read Iov
-  init_read_iov(conn.read_iov);
-  conn.read_iov_initialized = true;
-
-  // Initialize write Iov
-  init_write_iov(conn.write_iov);
-  conn.write_iov_initialized = true;
-
-  // File descriptors start uninitialized
-  conn.fd = -1;
-
+  ensure_ring(conn, true);
+  ensure_ring(conn, false);
   return conn;
 }
 
 /**
- * Open a file for read or write.
+ * Create the Ior and Iov for one direction if they are not initialized.
  *
- * Steps:
- * 1. Open file with appropriate flags (O_RDONLY or O_WRONLY|O_CREAT)
- * 2. Register FD with 3FS via hf3fs_reg_fd
- * 3. Store file path in connection
+ * Rings are created eagerly in create_connection and recreated here after
+ * ring_io discards one following a ring-level error.
  *
  * @param conn Connection to use
- * @param file_path Path to file
- * @param for_write true for write, false for read
- * @throws std::runtime_error if open or hf3fs_reg_fd fails
+ * @param for_read true for the read ring, false for the write ring
+ * @throws std::runtime_error if hf3fs_iorcreate4 or hf3fs_iovcreate fails
  */
-void Hf3fsConnector::open_file(WorkerHf3fsConn& conn,
-                               const std::string& file_path, bool for_write) {
-  int flags = for_write ? (O_WRONLY | O_CREAT) : O_RDONLY;
-  mode_t mode = for_write ? 0644 : 0;
-
-  conn.fd = ::open(file_path.c_str(), flags, mode);
-  if (conn.fd < 0) {
-    throw std::runtime_error("open failed: " + std::string(strerror(errno)));
-  }
-
-  int reg_result = hf3fs_reg_fd(conn.fd, 0);
-  if (reg_result > 0) {
-    ::close(conn.fd);
-    conn.fd = -1;
-    throw std::runtime_error(
-        "hf3fs_reg_fd failed: " + std::to_string(reg_result) +
-        " (errno=" + strerror(reg_result) + ")");
-  }
-  conn.registered = true;
-  conn.file_path = file_path;
-}
-
-/**
- * Close a file and deregister from 3FS.
- *
- * Steps:
- * 1. Deregister FD from 3FS via hf3fs_dereg_fd
- * 2. Close Linux FD
- * 3. Clear file path
- *
- * @param conn Connection to use
- */
-void Hf3fsConnector::close_file(WorkerHf3fsConn& conn) {
-  // Step 1: Deregister FD from 3FS first (only if registration succeeded)
-  if (conn.registered) {
-    hf3fs_dereg_fd(conn.fd);
-    conn.registered = false;
-  }
-  // Step 2: Close Linux FD
-  if (conn.fd >= 0) {
-    ::close(conn.fd);
-    conn.fd = -1;
-  }
-  conn.file_path.clear();
-}
-
-/**
- * Read data from a file using 3FS I/O.
- *
- * Steps (per chunk):
- * 1. Prepare I/O request via hf3fs_prep_io
- * 2. Submit I/O via hf3fs_submit_ios
- * 3. Wait for completion via hf3fs_wait_for_ios
- * 4. Copy data from Iov buffer to output buffer
- *
- * If len > iov_size_, data is read in multiple chunks.
- *
- * @param conn Connection to use
- * @param ior Ior to use for I/O
- * @param iov Iov buffer for data
- * @param buf Output buffer
- * @param len Number of bytes to read
- * @throws std::runtime_error if any 3FS operation fails
- */
-void Hf3fsConnector::read_file(WorkerHf3fsConn& conn, hf3fs_ior& ior,
-                               hf3fs_iov& iov, void* buf, size_t len) {
-  size_t file_offset = 0;
-  size_t total_read = 0;
-
-  while (file_offset < len) {
-    size_t sub_len = std::min(iov_size_, len - file_offset);
-
-    int ret = hf3fs_prep_io(&ior, &iov, true, iov.base, conn.fd, file_offset,
-                            sub_len, nullptr);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_prep_io failed: " + std::to_string(-ret));
+void Hf3fsConnector::ensure_ring(WorkerHf3fsConn& conn, bool for_read) {
+  if (for_read) {
+    if (!conn.read_ior_initialized) {
+      init_read_ior(conn.read_ior);
+      conn.read_ior_initialized = true;
     }
-
-    ret = hf3fs_submit_ios(&ior);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_submit_ios failed: " +
-                               std::to_string(-ret));
+    if (!conn.read_iov_initialized) {
+      init_read_iov(conn.read_iov);
+      conn.read_iov_initialized = true;
     }
-
-    hf3fs_cqe cqe;
-    ret = hf3fs_wait_for_ios(&ior, &cqe, 1, 1, nullptr);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_wait_for_ios failed: " +
-                               std::to_string(-ret));
+  } else {
+    if (!conn.write_ior_initialized) {
+      init_write_ior(conn.write_ior);
+      conn.write_ior_initialized = true;
     }
-    if (cqe.result < 0) {
-      throw std::runtime_error("I/O failed: " + std::to_string(-cqe.result));
+    if (!conn.write_iov_initialized) {
+      init_write_iov(conn.write_iov);
+      conn.write_iov_initialized = true;
     }
-    if (cqe.result != sub_len) {
-      throw std::runtime_error(
-          "read_file (" + conn.file_path + ") failed, requested " +
-          std::to_string(sub_len) + " but got " + std::to_string(cqe.result));
-    }
-    memcpy(static_cast<char*>(buf) + total_read, iov.base, sub_len);
-    total_read += sub_len;
-    file_offset += sub_len;
-  }
-}
-
-/**
- * Write data to a file using 3FS I/O.
- *
- * Steps (per chunk):
- * 1. Copy data to Iov buffer
- * 2. Prepare I/O request via hf3fs_prep_io
- * 3. Submit I/O via hf3fs_submit_ios
- * 4. Wait for completion via hf3fs_wait_for_ios
- *
- * If len > iov_size_, data is written in multiple chunks.
- *
- * @param conn Connection to use
- * @param ior Ior to use for I/O
- * @param iov Iov buffer for data
- * @param buf Input buffer
- * @param len Number of bytes to write
- * @throws std::runtime_error if any 3FS operation fails
- */
-void Hf3fsConnector::write_file(WorkerHf3fsConn& conn, hf3fs_ior& ior,
-                                hf3fs_iov& iov, const void* buf, size_t len) {
-  size_t file_offset = 0;
-  size_t total_written = 0;
-
-  while (file_offset < len) {
-    size_t sub_len = std::min(iov_size_, len - file_offset);
-
-    // Copy data to Iov buffer
-    memcpy(iov.base, static_cast<const char*>(buf) + file_offset, sub_len);
-
-    int ret = hf3fs_prep_io(&ior, &iov, false, iov.base, conn.fd, file_offset,
-                            sub_len, nullptr);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_prep_io failed: " + std::to_string(-ret));
-    }
-
-    ret = hf3fs_submit_ios(&ior);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_submit_ios failed: " +
-                               std::to_string(-ret));
-    }
-
-    hf3fs_cqe cqe;
-    ret = hf3fs_wait_for_ios(&ior, &cqe, 1, 1, nullptr);
-    if (ret < 0) {
-      throw std::runtime_error("hf3fs_wait_for_ios failed: " +
-                               std::to_string(-ret));
-    }
-    if (cqe.result < 0) {
-      throw std::runtime_error("I/O failed: " + std::to_string(-cqe.result));
-    }
-
-    if (cqe.result != sub_len) {
-      throw std::runtime_error(
-          "write_file (" + conn.file_path + ") failed, requested " +
-          std::to_string(sub_len) + " but got " + std::to_string(cqe.result));
-    }
-    total_written += sub_len;
-    file_offset += sub_len;
   }
 }
 
@@ -453,66 +339,244 @@ std::string Hf3fsConnector::key_to_path(const std::string& key) {
 }
 
 /**
- * Retrieve data for a key.
+ * Run reads or writes for many keys through one USRBIO ring.
  *
- * Steps:
- * 1. Convert key to file path
- * 2. Open file for reading
- * 3. Read data using 3FS I/O
- * 4. Close file
+ * Each key's data is split into segments of at most iov_size_ bytes. Segments
+ * are packed into the Iov at increasing offsets and prepared on the ring
+ * until either the ring (ior_entries_) or the Iov (iov_size_) is full; then
+ * the whole wave is submitted with a single hf3fs_submit_ios and reaped
+ * together. This lets 3FS work on many I/Os concurrently instead of one
+ * round trip per key.
+ *
+ * Writes copy the source data into the Iov before prepping; reads copy
+ * completed segments out of the Iov after the wave is reaped. A file stays
+ * registered until the wave holding its last segment completes, so the number
+ * of open fds is bounded by the wave, not the batch.
+ *
+ * If the ring itself fails (it cannot be created, or prep, submit, or wait
+ * returns an error), it may still hold prepared or in-flight I/Os that
+ * reference this call's files and Iov offsets. The ring and Iov for this
+ * direction are then destroyed before the files are released, so no stale
+ * completion or buffer write can leak into a later call; the next call
+ * recreates them. Keys whose I/Os all completed in earlier waves keep their
+ * result; every other key is failed with the ring error.
+ *
+ * @param conn Connection owning the rings
+ * @param for_read true to read into bufs, false to write from bufs
+ * @param keys Keys to access
+ * @param bufs Per-key user buffers
+ * @param lens Per-key byte counts
+ * @return Per-key error messages; an empty string means the key succeeded
+ */
+std::vector<std::string> Hf3fsConnector::ring_io(
+    WorkerHf3fsConn& conn, bool for_read, const std::vector<std::string>& keys,
+    const std::vector<void*>& bufs, const std::vector<size_t>& lens) {
+  struct Segment {
+    size_t key_idx;
+    size_t file_off;
+    size_t len;
+    size_t iov_off;
+  };
+
+  std::vector<std::string> errors(keys.size());
+  try {
+    ensure_ring(conn, for_read);
+  } catch (const std::exception& e) {
+    errors.assign(keys.size(), e.what());
+    return errors;
+  }
+  hf3fs_ior& ior = for_read ? conn.read_ior : conn.write_ior;
+  hf3fs_iov& iov = for_read ? conn.read_iov : conn.write_iov;
+
+  const size_t max_entries = static_cast<size_t>(ior_entries_);
+  // Declared outside the try below so files stay registered until the ring
+  // that may still reference them has been destroyed.
+  std::vector<std::optional<RegisteredFile>> files(keys.size());
+  std::vector<Segment> wave;
+  wave.reserve(max_entries);
+  std::vector<hf3fs_cqe> cqes(max_entries);
+  size_t iov_used = 0;
+  // Keys before this index have all their I/Os reaped.
+  size_t first_open_key = 0;
+
+  auto flush_wave = [&](size_t next_key_idx) {
+    if (!wave.empty()) {
+      int ret = hf3fs_submit_ios(&ior);
+      if (ret < 0) {
+        throw std::runtime_error("hf3fs_submit_ios failed: " +
+                                 std::to_string(-ret));
+      }
+      size_t reaped = 0;
+      while (reaped < wave.size()) {
+        int remaining = static_cast<int>(wave.size() - reaped);
+        ret = hf3fs_wait_for_ios(&ior, cqes.data(), remaining, remaining,
+                                 nullptr);
+        if (ret < 0) {
+          throw std::runtime_error("hf3fs_wait_for_ios failed: " +
+                                   std::to_string(-ret));
+        }
+        for (int c = 0; c < ret; ++c) {
+          const Segment& seg =
+              wave[reinterpret_cast<uintptr_t>(cqes[c].userdata)];
+          std::string& err = errors[seg.key_idx];
+          if (cqes[c].result != static_cast<int64_t>(seg.len)) {
+            if (err.empty()) {
+              err = std::string(for_read ? "read" : "write") + " (" +
+                    key_to_path(keys[seg.key_idx]) + ") failed, requested " +
+                    std::to_string(seg.len) + " but got " +
+                    std::to_string(cqes[c].result);
+            }
+          } else if (for_read && err.empty()) {
+            memcpy(static_cast<char*>(bufs[seg.key_idx]) + seg.file_off,
+                   iov.base + seg.iov_off, seg.len);
+          }
+        }
+        reaped += static_cast<size_t>(ret);
+      }
+      wave.clear();
+      iov_used = 0;
+    }
+    for (; first_open_key < next_key_idx; ++first_open_key) {
+      files[first_open_key].reset();
+    }
+  };
+
+  try {
+    for (size_t i = 0; i < keys.size(); ++i) {
+      try {
+        files[i].emplace(key_to_path(keys[i]), !for_read);
+      } catch (const std::exception& e) {
+        errors[i] = e.what();
+        continue;
+      }
+      for (size_t off = 0; off < lens[i];) {
+        size_t sub_len = std::min(iov_size_, lens[i] - off);
+        if (wave.size() == max_entries || iov_used + sub_len > iov_size_) {
+          // Earlier segments of key i may be in this wave; keep it open.
+          flush_wave(i);
+        }
+        uint8_t* ptr = iov.base + iov_used;
+        if (!for_read) {
+          memcpy(ptr, static_cast<const char*>(bufs[i]) + off, sub_len);
+        }
+        // userdata carries the segment's index in the wave.
+        int ret =
+            hf3fs_prep_io(&ior, &iov, for_read, ptr, files[i]->fd(), off,
+                          sub_len, reinterpret_cast<const void*>(wave.size()));
+        if (ret < 0) {
+          throw std::runtime_error("hf3fs_prep_io failed: " +
+                                   std::to_string(-ret));
+        }
+        wave.push_back({i, off, sub_len, iov_used});
+        iov_used += sub_len;
+        off += sub_len;
+      }
+    }
+    flush_wave(keys.size());
+  } catch (const std::exception& e) {
+    conn.destroy_ring(for_read);
+    for (size_t k = first_open_key; k < keys.size(); ++k) {
+      if (errors[k].empty()) {
+        errors[k] = e.what();
+      }
+    }
+  }
+  return errors;
+}
+
+/**
+ * Retrieve data for a single key through the read ring.
  *
  * @param conn Connection to use
  * @param key Key to retrieve
  * @param buf Output buffer
  * @param len Number of bytes to read
  * @param chunk_size Chunk size (unused for 3FS)
+ * @throws std::runtime_error if the read fails
  */
 void Hf3fsConnector::do_single_get(WorkerHf3fsConn& conn,
                                    const std::string& key, void* buf,
                                    size_t len, size_t chunk_size) {
   (void)chunk_size;  // Unused for 3FS
-  std::string file_path = key_to_path(key);
-  open_file(conn, file_path, false);
-  try {
-    read_file(conn, conn.read_ior, conn.read_iov, buf, len);
-  } catch (const std::exception& e) {
-    close_file(conn);
-    throw;
+  auto errors = ring_io(conn, true, {key}, {buf}, {len});
+  if (!errors[0].empty()) {
+    throw std::runtime_error(errors[0]);
   }
-  close_file(conn);
 }
 
 /**
- * Store data for a key.
- *
- * Steps:
- * 1. Convert key to file path
- * 2. Open file for writing
- * 3. Write data using 3FS I/O
- * 4. Close file
+ * Store data for a single key through the write ring.
  *
  * @param conn Connection to use
  * @param key Key to store
  * @param buf Input buffer
  * @param len Number of bytes to write
  * @param chunk_size Chunk size (unused for 3FS)
+ * @throws std::runtime_error if the write fails
  */
 void Hf3fsConnector::do_single_set(WorkerHf3fsConn& conn,
                                    const std::string& key, const void* buf,
                                    size_t len, size_t chunk_size) {
   (void)chunk_size;  // Unused for 3FS
-
-  std::string file_path = key_to_path(key);
-  open_file(conn, file_path, true);
-  try {
-    write_file(conn, conn.write_ior, conn.write_iov, buf, len);
-  } catch (const std::exception& e) {
-    close_file(conn);
-    throw;
+  auto errors = ring_io(conn, false, {key}, {const_cast<void*>(buf)}, {len});
+  if (!errors[0].empty()) {
+    throw std::runtime_error(errors[0]);
   }
-  close_file(conn);
   if (buffer_enabled_) {
     buffer_add_(key);
+  }
+}
+
+/**
+ * Retrieve a tile of keys with batched ring I/O.
+ *
+ * Per-key failures (e.g. missing file, short read) only zero that key's
+ * result, matching ConnectorBase's load error tolerance. A ring failure zeroes
+ * only the keys whose I/Os had not completed by then.
+ *
+ * @param conn Connection to use
+ * @param req Tile request
+ */
+void Hf3fsConnector::do_batch_get(WorkerHf3fsConn& conn, const Request& req) {
+  auto errors = ring_io(conn, true, req.keys, req.buf_ptrs, req.buf_lens);
+  for (size_t i = 0; i < errors.size(); ++i) {
+    bool ok = errors[i].empty();
+    req.batch->per_key_results[req.start_idx + i] = ok ? 1 : 0;
+    if (!ok) {
+      fprintf(stderr, "[LMCache GET] key %s failed: %s\n", req.keys[i].c_str(),
+              errors[i].c_str());
+    }
+  }
+}
+
+/**
+ * Store a tile of keys with batched ring I/O.
+ *
+ * A failed key does not stop the others; after a ring failure, keys not yet
+ * written are failed. Successfully written keys are added to the key buffer
+ * even when others in the tile fail.
+ *
+ * @param conn Connection to use
+ * @param req Tile request
+ * @throws std::runtime_error if any key fails, naming the first failure
+ */
+void Hf3fsConnector::do_batch_set(WorkerHf3fsConn& conn, const Request& req) {
+  auto errors = ring_io(conn, false, req.keys, req.buf_ptrs, req.buf_lens);
+  size_t num_failed = 0;
+  const std::string* first_error = nullptr;
+  for (size_t i = 0; i < errors.size(); ++i) {
+    if (errors[i].empty()) {
+      if (buffer_enabled_) {
+        buffer_add_(req.keys[i]);
+      }
+    } else if (num_failed++ == 0) {
+      first_error = &errors[i];
+    }
+  }
+  if (num_failed > 0) {
+    throw std::runtime_error(std::to_string(num_failed) + " of " +
+                             std::to_string(errors.size()) +
+                             " keys failed to store, first: " + *first_error);
   }
 }
 

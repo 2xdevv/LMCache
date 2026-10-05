@@ -22,23 +22,17 @@ namespace connector {
  * Per-thread connection state for the 3FS connector.
  *
  * Each worker thread maintains its own:
- * - File descriptors (Linux FD + 3FS registered FD)
  * - Dual Ior (I/O rings) for read and write operations
  * - Dual Iov (I/O buffers) for read and write operations
  *
  * Design rationale:
  * - Dual Ior: 3FS Ior cannot handle read and write simultaneously
- * - Per-thread Iov: Avoids synchronization overhead and IB registration
- * complexity
- * - FD per I/O: Register on open, deregister on close for proper resource
- * management
+ * - Per-thread Ior/Iov: hf3fs_prep_io is not thread safe, and private
+ *   buffers avoid synchronization and IB registration complexity
+ * - File descriptors are not part of the connection: a batch keeps many
+ *   files registered at once while their I/Os share the ring
  */
 struct WorkerHf3fsConn {
-  // File descriptors
-  int fd = -1;              // Linux file descriptor
-  bool registered = false;  // Whether hf3fs_reg_fd succeeded
-  std::string file_path;    // Current file path being accessed
-
   // I/O Rings (separate for read and write)
   // 3FS documentation states Ior cannot handle both read and write
   // simultaneously
@@ -55,34 +49,36 @@ struct WorkerHf3fsConn {
   bool write_iov_initialized = false;
 
   /**
-   * Destructor - cleans up all 3FS resources.
+   * Destroy the Ior and Iov for one direction, if initialized.
    *
-   * Cleanup order:
-   * 1. Deregister FD from 3FS (only if registration succeeded and not already
-   * done)
-   * 2. Close Linux FD (if not already closed by close_file)
-   * 3. Destroy Ior structures (read, then write)
-   * 4. Destroy Iov structures (read, then write)
+   * Used to discard a ring whose in-flight state is unknown after an error;
+   * Hf3fsConnector::ensure_ring recreates it before the next use.
+   *
+   * @param for_read true for the read ring, false for the write ring
+   */
+  void destroy_ring(bool for_read) {
+    hf3fs_ior& ior = for_read ? read_ior : write_ior;
+    bool& ior_initialized =
+        for_read ? read_ior_initialized : write_ior_initialized;
+    hf3fs_iov& iov = for_read ? read_iov : write_iov;
+    bool& iov_initialized =
+        for_read ? read_iov_initialized : write_iov_initialized;
+    if (ior_initialized) {
+      hf3fs_iordestroy(&ior);
+      ior_initialized = false;
+    }
+    if (iov_initialized) {
+      hf3fs_iovdestroy(&iov);
+      iov_initialized = false;
+    }
+  }
+
+  /**
+   * Destructor - destroys the read ring, then the write ring.
    */
   ~WorkerHf3fsConn() {
-    if (registered) {
-      hf3fs_dereg_fd(fd);
-    }
-    if (fd >= 0) {
-      ::close(fd);
-    }
-    if (read_ior_initialized) {
-      hf3fs_iordestroy(&read_ior);
-    }
-    if (write_ior_initialized) {
-      hf3fs_iordestroy(&write_ior);
-    }
-    if (read_iov_initialized) {
-      hf3fs_iovdestroy(&read_iov);
-    }
-    if (write_iov_initialized) {
-      hf3fs_iovdestroy(&write_iov);
-    }
+    destroy_ring(true);
+    destroy_ring(false);
   }
 };
 
@@ -96,8 +92,10 @@ struct WorkerHf3fsConn {
  * Features:
  * - GIL-free operations for true concurrency
  * - Per-thread Ior/Iov for parallel read/write
+ * - Batched USRBIO: each worker submits its whole tile through its ring in
+ *   waves bounded by ior_entries and iov_size, instead of one I/O at a time
  * - Multi-path load balancing based on chunk_hash
- * - FD registration per I/O operation
+ * - FD registration per file, released once the file's I/Os complete
  * - Mock layer for SDK-independent development
  *
  * Example usage:
@@ -155,6 +153,8 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
                      const void* buf, size_t len, size_t chunk_size) override;
   bool do_single_exists(WorkerHf3fsConn& conn, const std::string& key) override;
   bool do_single_delete(WorkerHf3fsConn& conn, const std::string& key) override;
+  void do_batch_get(WorkerHf3fsConn& conn, const Request& req) override;
+  void do_batch_set(WorkerHf3fsConn& conn, const Request& req) override;
   void do_batch_exists(WorkerHf3fsConn& conn, const Request& req) override;
   void shutdown_connections() override;
 
@@ -190,14 +190,13 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
   void init_read_iov(hf3fs_iov& iov);
   void init_write_iov(hf3fs_iov& iov);
 
-  // File operations
-  void open_file(WorkerHf3fsConn& conn, const std::string& file_path,
-                 bool for_write);
-  void close_file(WorkerHf3fsConn& conn);
-  void read_file(WorkerHf3fsConn& conn, hf3fs_ior& ior, hf3fs_iov& iov,
-                 void* buf, size_t len);
-  void write_file(WorkerHf3fsConn& conn, hf3fs_ior& ior, hf3fs_iov& iov,
-                  const void* buf, size_t len);
+  void ensure_ring(WorkerHf3fsConn& conn, bool for_read);
+
+  // Batched ring I/O shared by get and set
+  std::vector<std::string> ring_io(WorkerHf3fsConn& conn, bool for_read,
+                                   const std::vector<std::string>& keys,
+                                   const std::vector<void*>& bufs,
+                                   const std::vector<size_t>& lens);
 };
 
 }  // namespace connector

@@ -81,12 +81,15 @@ The **BUILD_HF3FS** environment variable controls compilation:
 - ``base_paths`` (str, required): Comma-separated subdirectories under
   ``mount_point``.
 - ``ior_entries`` (int, default ``256``, range ``[128, 1024]``): Max
-  concurrent requests per Ior.
-- ``io_depth`` (int, default ``0``, range ``[-128, 128]``): Batch control
-  parameter.
+  I/Os a worker submits to its ring in one wave (see *Batched I/O*).
+- ``io_depth`` (int, default ``0``, range ``[-128, 128]``): How the 3FS
+  ring worker drains submitted I/Os.  ``0`` processes them as soon as
+  possible.  Keep the default: other values (e.g. ``16`` or ``-16``) have
+  been observed to hang I/O.
 - ``numa_id`` (int, default ``-1``): NUMA node ID (``-1`` = current node).
 - ``iov_size`` (int, default ``209715200`` (200 MB), range
-  ``[104857600, 2147483648]``): Per-thread I/O buffer in bytes.
+  ``[104857600, 2147483648]``): Per-thread I/O buffer in bytes.  Also the
+  maximum bytes in flight per worker in one wave.
 - ``enable_key_buffer`` (bool, default ``True``): Enable the in-memory
   key buffer for accelerated exists lookups.  When enabled, exist lookups
   respond from a hash set instead of issuing remote 3FS metadata calls.
@@ -113,6 +116,25 @@ The **BUILD_HF3FS** environment variable controls compilation:
       }
     }'
 
+
+**Batched I/O**
+
+Each worker owns one read ring and one write ring (Usrbio ``Ior``), each
+backed by its own ``Iov`` buffer.  A worker handles its share of a batch in
+waves instead of issuing one I/O per key:
+
+1. Open and register (``hf3fs_reg_fd``) the next key's file, and prepare its
+   I/O at the next free offset in the ``Iov`` (keys larger than ``iov_size``
+   are split into several I/Os).
+2. Repeat until the ring holds ``ior_entries`` I/Os or the ``Iov`` is full.
+3. Submit the wave once (``hf3fs_submit_ios``) and reap every completion.
+4. Copy read data out of the ``Iov``, then deregister and close the files
+   whose I/Os have all completed.
+
+For example, with the default ``iov_size`` (200 MB) and 8 MB KV chunks, a
+worker keeps 25 chunks in flight per wave, where the earlier design waited on
+each chunk before starting the next.  A failed key (e.g. a missing file) only
+fails that key; the rest of the wave still completes.
 
 **In-Memory Key Buffer**
 
