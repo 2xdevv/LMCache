@@ -471,6 +471,13 @@ std::vector<std::string> Hf3fsConnector::ring_io(
         iov_used += sub_len;
         off += sub_len;
       }
+      // Start this key's I/O now so it overlaps opening the next files,
+      // instead of idling until the whole wave is prepped.
+      int ret = hf3fs_submit_ios(&ior);
+      if (ret < 0) {
+        throw std::runtime_error("hf3fs_submit_ios failed: " +
+                                 std::to_string(-ret));
+      }
     }
     flush_wave(keys.size());
   } catch (const std::exception& e) {
