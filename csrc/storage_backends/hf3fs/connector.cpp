@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <limits.h>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <sstream>
@@ -21,6 +22,30 @@ namespace lmcache {
 namespace connector {
 
 namespace {
+
+/**
+ * Compute the Iov allocation size from the per-entry byte budget.
+ *
+ * @param single_buffer_size Positive bytes per ring entry
+ * @param entries Positive ring capacity
+ * @return Bytes allocated per worker per direction
+ * @throws std::invalid_argument if either size is zero, entries is negative,
+ * or their product exceeds size_t
+ */
+size_t get_iov_size(size_t single_buffer_size, int entries) {
+  if (entries <= 0) {
+    throw std::invalid_argument("ior_entries must be positive");
+  }
+  if (single_buffer_size == 0) {
+    throw std::invalid_argument("single_buffer_size must be positive");
+  }
+  if (single_buffer_size >
+      std::numeric_limits<size_t>::max() / static_cast<size_t>(entries)) {
+    throw std::invalid_argument(
+        "single_buffer_size * ior_entries exceeds size_t");
+  }
+  return single_buffer_size * static_cast<size_t>(entries);
+}
 
 /**
  * An open file registered with 3FS for USRBIO.
@@ -78,19 +103,20 @@ class RegisteredFile {
  * Validates:
  * - mount_point is a valid 3FS path (via hf3fs_extract_mount_point)
  * - Each base_path is a subdirectory of mount_point
- * - Parameters are within valid ranges
+ * - Ring capacity and per-entry buffer size are positive, and their product
+ *   fits in size_t
  */
 Hf3fsConnector::Hf3fsConnector(std::string mount_point, std::string base_paths,
                                int num_workers, int ior_entries, int io_depth,
-                               int numa_id, size_t iov_size, int time_out,
-                               bool enable_key_buffer,
+                               int numa_id, size_t single_buffer_size,
+                               int time_out, bool enable_key_buffer,
                                WorkerPoolConfig worker_pool_config)
     : ConnectorBase(num_workers, std::move(worker_pool_config)),
       mount_point_(std::move(mount_point)),
       ior_entries_(ior_entries),
       io_depth_(io_depth),
       numa_id_(numa_id),
-      iov_size_(iov_size),
+      iov_size_(get_iov_size(single_buffer_size, ior_entries)),
       time_out_(time_out),
       buffer_enabled_(enable_key_buffer) {
   // Debug print worker pool configuration
@@ -451,7 +477,7 @@ std::vector<std::string> Hf3fsConnector::ring_io(
       }
       for (size_t off = 0; off < lens[i];) {
         size_t sub_len = std::min(iov_size_, lens[i] - off);
-        if (wave.size() == max_entries || iov_used + sub_len > iov_size_) {
+        if (wave.size() == max_entries || sub_len > iov_size_ - iov_used) {
           // Earlier segments of key i may be in this wave; keep it open.
           flush_wave(i);
         }

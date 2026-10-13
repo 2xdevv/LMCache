@@ -93,7 +93,7 @@ struct WorkerHf3fsConn {
  * - GIL-free operations for true concurrency
  * - Per-thread Ior/Iov for parallel read/write
  * - Batched USRBIO: each worker submits its whole tile through its ring in
- *   waves bounded by ior_entries and iov_size, instead of one I/O at a time
+ *   waves bounded by ior_entries and the derived Iov size
  * - Multi-path load balancing based on chunk_hash
  * - FD registration per file, released once the file's I/Os complete
  * - Mock layer for SDK-independent development
@@ -104,10 +104,10 @@ struct WorkerHf3fsConn {
  *       "/mnt/3fs",                    // mount_point
  *       "/mnt/3fs/path1,/mnt/3fs/path2", // base_paths
  *       8,                             // num_workers
- *       256,                           // ior_entries
+ *       8,                             // ior_entries
  *       0,                             // io_depth
  *       -1,                            // numa_id
- *       209715200,                     // iov_size (200MB)
+ *       16777216,                       // single_buffer_size (16 MiB)
  *       200                            // time_out (ms)
  *   );
  * @endcode
@@ -120,12 +120,11 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
    * @param mount_point 3FS mount point directory (must exist and be valid)
    * @param base_paths Comma-separated subdirectories under mount_point
    * @param num_workers Number of worker threads (default 8)
-   * @param ior_entries Max concurrent requests per Ior (default 256, range
-   * [128, 1024])
+   * @param ior_entries Positive max concurrent requests per Ior (default 8)
    * @param io_depth Batch control parameter (default 0, range [-128, 128])
    * @param numa_id NUMA node ID (default -1 = current node)
-   * @param iov_size Per-thread I/O buffer size in bytes (default 200MB, range
-   * [100MB, 2GB])
+   * @param single_buffer_size Positive bytes per ring entry (default 16 MiB).
+   * Each read/write Iov has single_buffer_size * ior_entries bytes per worker.
    * @param time_out I/O timeout in milliseconds (default 200)
    * @param enable_key_buffer Enable in-memory key buffer for accelerated
    * exists lookups (default true)
@@ -134,12 +133,12 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
 +  * ("lookup", "retrieve", "store", "delete") to worker counts.
    * @throws std::runtime_error if mount_point is invalid or base_paths are not
    * subdirectories
-   * @throws std::runtime_error if ior_entries, io_depth, or iov_size are out of
-   * range
+   * @throws std::invalid_argument if ior_entries or single_buffer_size is not
+   * positive, or their product exceeds size_t
    */
   Hf3fsConnector(std::string mount_point, std::string base_paths,
-                 int num_workers, int ior_entries = 256, int io_depth = 0,
-                 int numa_id = -1, size_t iov_size = 209715200,
+                 int num_workers, int ior_entries = 8, int io_depth = 0,
+                 int numa_id = -1, size_t single_buffer_size = 16777216,
                  int time_out = 200, bool enable_key_buffer = true,
                  WorkerPoolConfig worker_pool_config = {});
 
@@ -165,6 +164,7 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
   int ior_entries_;
   int io_depth_;
   int numa_id_;
+  // Bytes per direction, derived from single_buffer_size * ior_entries.
   size_t iov_size_;
   int time_out_;
 

@@ -21,6 +21,7 @@ Runtime test gating:
 # Standard
 from pathlib import Path
 from typing import Any
+import ctypes
 import os
 import shutil
 import time
@@ -291,10 +292,10 @@ def hf3fs_native_client(hf3fs_test_base_path):
         mount_point=str(mount_point),
         base_paths=base_paths,
         num_workers=2,
-        ior_entries=128,
+        ior_entries=8,
         io_depth=0,
         numa_id=-1,
-        iov_size=209715200,
+        single_buffer_size=16777216,
         time_out=200,
         enable_key_buffer=True,
     )
@@ -328,7 +329,9 @@ def hf3fs_l2_adapter(hf3fs_native_client):
 class TestHf3fsL2AdapterConfig:
     """Unit tests for Hf3fsL2AdapterConfig validation."""
 
-    def test_valid_config(self, hf3fs_test_mount_point, hf3fs_test_base_path):
+    def test_valid_config(
+        self, hf3fs_test_mount_point: Path, hf3fs_test_base_path: Path
+    ) -> None:
         """Test valid config creation."""
         config_dict = {
             "mount_point": str(hf3fs_test_mount_point),
@@ -339,10 +342,11 @@ class TestHf3fsL2AdapterConfig:
         assert config.mount_point == str(hf3fs_test_mount_point)
         assert config.base_paths == str(hf3fs_test_base_path)
         assert config.num_workers == 4
-        assert config.ior_entries == 256  # default
+        assert config.ior_entries == 8  # default
         assert config.io_depth == 0  # default
         assert config.numa_id == -1  # default
-        assert config.iov_size == 209715200  # default
+        assert config.single_buffer_size == 16777216  # default
+        assert config.iov_size == 134217728
 
     def test_invalid_mount_point_not_exists(self):
         """Test validation fails when mount_point doesn't exist."""
@@ -388,19 +392,35 @@ class TestHf3fsL2AdapterConfig:
         with pytest.raises(ValueError, match="does not exist"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-    def test_invalid_ior_entries_range(self, hf3fs_test_base_path):
-        """Test validation fails for ior_entries outside [128, 1024]."""
+    @pytest.mark.parametrize("ior_entries", [0, -1, 1.5, "8", True, None])
+    def test_invalid_ior_entries(
+        self, hf3fs_test_base_path: Path, ior_entries: int | float | str | None
+    ) -> None:
+        """Reject ring capacities that are not positive integers."""
         config_dict = {
             "mount_point": str(hf3fs_test_base_path.parent),
             "base_paths": str(hf3fs_test_base_path),
-            "ior_entries": 50,
+            "ior_entries": ior_entries,
         }
-        with pytest.raises(ValueError, match="range"):
+        with pytest.raises(ValueError, match="ior_entries must be a positive integer"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-        config_dict["ior_entries"] = 2000
-        with pytest.raises(ValueError, match="range"):
-            Hf3fsL2AdapterConfig.from_dict(config_dict)
+    @pytest.mark.parametrize("ior_entries", [1, 8, 50, 2000])
+    def test_positive_ior_entries(
+        self, hf3fs_test_base_path: Path, ior_entries: int
+    ) -> None:
+        """Accept capacities below and above the old range and derive Iov size."""
+        config = Hf3fsL2AdapterConfig.from_dict(
+            {
+                "mount_point": str(hf3fs_test_base_path.parent),
+                "base_paths": str(hf3fs_test_base_path),
+                "ior_entries": ior_entries,
+                "single_buffer_size": 1024,
+            }
+        )
+        assert config.ior_entries == ior_entries
+        assert config.single_buffer_size == 1024
+        assert config.iov_size == 1024 * ior_entries
 
     def test_invalid_io_depth_range(self, hf3fs_test_base_path):
         """Test validation fails for io_depth outside [-128, 128]."""
@@ -416,19 +436,71 @@ class TestHf3fsL2AdapterConfig:
         with pytest.raises(ValueError, match="range"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-    def test_invalid_iov_size_range(self, hf3fs_test_base_path):
-        """Test validation fails for iov_size outside [100MB, 2GB]."""
+    @pytest.mark.parametrize("single_buffer_size", [0, -1, 1.5, "1024", True, None])
+    def test_invalid_single_buffer_size(
+        self, hf3fs_test_base_path: Path, single_buffer_size: int | float | str | None
+    ) -> None:
+        """Reject per-entry sizes that are not positive integers."""
         config_dict = {
             "mount_point": str(hf3fs_test_base_path.parent),
             "base_paths": str(hf3fs_test_base_path),
-            "iov_size": 50000000,  # 50MB
+            "single_buffer_size": single_buffer_size,
         }
-        with pytest.raises(ValueError, match="range"):
+        with pytest.raises(
+            ValueError, match="single_buffer_size must be a positive integer"
+        ):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-        config_dict["iov_size"] = 3000000000  # 3GB
-        with pytest.raises(ValueError, match="range"):
-            Hf3fsL2AdapterConfig.from_dict(config_dict)
+    @pytest.mark.parametrize("single_buffer_size", [1, 1024, 3000000000])
+    def test_positive_single_buffer_size(
+        self, hf3fs_test_base_path: Path, single_buffer_size: int
+    ) -> None:
+        """The per-entry byte budget has no old whole-buffer range restriction."""
+        config = Hf3fsL2AdapterConfig.from_dict(
+            {
+                "mount_point": str(hf3fs_test_base_path.parent),
+                "base_paths": str(hf3fs_test_base_path),
+                "single_buffer_size": single_buffer_size,
+            }
+        )
+        assert config.single_buffer_size == single_buffer_size
+        assert config.iov_size == single_buffer_size * 8
+
+    def test_obsolete_iov_size(self, hf3fs_test_base_path: Path) -> None:
+        """Reject the obsolete allocation field instead of silently ignoring it."""
+        with pytest.raises(ValueError, match="use single_buffer_size"):
+            Hf3fsL2AdapterConfig.from_dict(
+                {
+                    "mount_point": str(hf3fs_test_base_path.parent),
+                    "base_paths": str(hf3fs_test_base_path),
+                    "iov_size": 209715200,
+                }
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"ior_entries": 0}, {"ior_entries": -1}, {"single_buffer_size": 0}],
+    )
+    def test_constructor_invalid_sizes(
+        self, hf3fs_test_base_path: Path, kwargs: dict[str, int]
+    ) -> None:
+        """Direct config construction also validates sizes before native use."""
+        with pytest.raises(ValueError, match="positive integer"):
+            Hf3fsL2AdapterConfig(
+                mount_point=str(hf3fs_test_base_path.parent),
+                base_paths=str(hf3fs_test_base_path),
+                **kwargs,
+            )
+
+    def test_constructor_buffer_size(self, hf3fs_test_base_path: Path) -> None:
+        """Direct construction derives the allocation from both supplied sizes."""
+        config = Hf3fsL2AdapterConfig(
+            mount_point=str(hf3fs_test_base_path.parent),
+            base_paths=str(hf3fs_test_base_path),
+            ior_entries=3,
+            single_buffer_size=4096,
+        )
+        assert config.iov_size == 12288
 
     def test_invalid_num_workers(self, hf3fs_test_base_path):
         """Test validation fails for invalid num_workers."""
@@ -450,7 +522,7 @@ class TestHf3fsL2AdapterConfig:
         config = Hf3fsL2AdapterConfig.from_dict(config_dict)
         assert config.base_paths == f"{path1},{path2}"
 
-    def test_help_method(self):
+    def test_help_method(self) -> None:
         """Test help method returns documentation."""
         help_text = Hf3fsL2AdapterConfig.help()
         assert "mount_point" in help_text
@@ -459,7 +531,7 @@ class TestHf3fsL2AdapterConfig:
         assert "ior_entries" in help_text
         assert "io_depth" in help_text
         assert "numa_id" in help_text
-        assert "iov_size" in help_text
+        assert "single_buffer_size" in help_text
 
 
 # =============================================================================
@@ -612,10 +684,10 @@ class TestHf3fsKeyBufferConfig:
             "mount_point": str(tmp_path),
             "base_paths": str(bp),
             "num_workers": 4,
-            "ior_entries": 256,
+            "ior_entries": 8,
             "io_depth": 0,
             "numa_id": -1,
-            "iov_size": 209715200,
+            "single_buffer_size": 16777216,
         }
         config = Hf3fsL2AdapterConfig.from_dict(d)
         assert config.enable_key_buffer is True
@@ -629,10 +701,10 @@ class TestHf3fsKeyBufferConfig:
             "mount_point": str(tmp_path),
             "base_paths": str(bp),
             "num_workers": 4,
-            "ior_entries": 256,
+            "ior_entries": 8,
             "io_depth": 0,
             "numa_id": -1,
-            "iov_size": 209715200,
+            "single_buffer_size": 16777216,
             "enable_key_buffer": "yes",
         }
         with pytest.raises(ValueError, match="boolean"):
@@ -660,10 +732,10 @@ class TestHf3fsAdapterFactory:
             mount_point=str(hf3fs_test_mount_point),
             base_paths=str(hf3fs_test_base_path),
             num_workers=2,
-            ior_entries=128,
+            ior_entries=8,
             io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
+            single_buffer_size=16777216,
             time_out=200,
             enable_key_buffer=True,
         )
@@ -705,6 +777,37 @@ class TestHf3fsAdapterFactory:
 # =============================================================================
 # Integration Tests (require C++ extension + 3FS cluster)
 # =============================================================================
+
+
+@requires_hf3fs
+class TestHf3fsNativeConfig:
+    """Native sizing validation does not require a mounted 3FS cluster."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"ior_entries": 0}, {"ior_entries": -1}, {"single_buffer_size": 0}],
+    )
+    def test_invalid_sizes(self, kwargs: dict[str, int]) -> None:
+        """Invalid sizes fail synchronously before accessing the mount."""
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        with pytest.raises(ValueError, match="must be positive"):
+            LMCacheHf3fsClient("/nonexistent/3fs", "/nonexistent/3fs/cache", **kwargs)
+
+    def test_buffer_size_overflow(self) -> None:
+        """Reject an allocation product that cannot be represented by size_t."""
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        max_size = (1 << (ctypes.sizeof(ctypes.c_size_t) * 8)) - 1
+        with pytest.raises(ValueError, match="exceeds size_t"):
+            LMCacheHf3fsClient(
+                "/nonexistent/3fs",
+                "/nonexistent/3fs/cache",
+                ior_entries=2,
+                single_buffer_size=max_size,
+            )
 
 
 @requires_hf3fs_cluster
@@ -760,6 +863,43 @@ class TestHf3fsNativeConnector:
 
         for i, (expected, buf) in enumerate(zip(data_list, buffers, strict=False)):
             assert bytes(buf) == expected, f"Key {i} mismatch"
+
+    @pytest.mark.parametrize("ior_entries", [1, 3, 8])
+    def test_sized_buffers_roundtrip(
+        self, hf3fs_test_base_path: Path, ior_entries: int
+    ) -> None:
+        """Small derived buffers support many waves and keys larger than an Iov."""
+        # First Party
+        from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+        single_buffer_size = 256
+        client = LMCacheHf3fsClient(
+            mount_point=str(hf3fs_test_base_path.parent),
+            base_paths=str(hf3fs_test_base_path),
+            num_workers=1,
+            ior_entries=ior_entries,
+            single_buffer_size=single_buffer_size,
+            enable_key_buffer=False,
+        )
+        keys = [
+            _object_key_to_string(create_object_key(i))
+            for i in range(ior_entries * 3 + 2)
+        ]
+        data = [bytes([i + 1]) * single_buffer_size for i in range(len(keys))]
+        data[-1] = b"\xff" * (single_buffer_size * ior_entries * 2 + 7)
+        try:
+            client.submit_batch_set(keys, [memoryview(d) for d in data])
+            stores = _wait_for_completions(client)
+            assert stores[0][1], stores[0][2]
+
+            buffers = [bytearray(len(d)) for d in data]
+            client.submit_batch_get(keys, [memoryview(buf) for buf in buffers])
+            loads = _wait_for_completions(client)
+            assert loads[0][1], loads[0][2]
+            assert all(loads[0][3])
+            assert [bytes(buf) for buf in buffers] == data
+        finally:
+            client.close()
 
     def test_exists_check(self, hf3fs_native_client):
         """Test exists() for existing and non-existing keys."""
@@ -837,10 +977,10 @@ class TestHf3fsNativeConnector:
                 mount_point=str(mp),
                 base_paths=f"{path1},{path2}",
                 num_workers=2,
-                ior_entries=128,
+                ior_entries=8,
                 io_depth=0,
                 numa_id=-1,
-                iov_size=209715200,
+                single_buffer_size=16777216,
                 time_out=200,
                 enable_key_buffer=True,
             )
@@ -897,10 +1037,10 @@ class TestHf3fsNativeConnector:
             mount_point=mount_point,
             base_paths=base_paths,
             num_workers=2,
-            ior_entries=128,
+            ior_entries=8,
             io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
+            single_buffer_size=16777216,
             time_out=200,
             enable_key_buffer=True,
         )
@@ -957,10 +1097,10 @@ class TestHf3fsNativeConnector:
             mount_point=str(mp),
             base_paths=base_paths,
             num_workers=num_workers,
-            ior_entries=128,
+            ior_entries=8,
             io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
+            single_buffer_size=16777216,
             time_out=200,
             enable_key_buffer=True,
         )
