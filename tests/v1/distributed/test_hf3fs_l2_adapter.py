@@ -291,11 +291,7 @@ def hf3fs_native_client(hf3fs_test_base_path):
         mount_point=str(mount_point),
         base_paths=base_paths,
         num_workers=2,
-        ior_entries=128,
-        io_depth=0,
         numa_id=-1,
-        iov_size=209715200,
-        time_out=200,
         enable_key_buffer=True,
     )
     yield client, str(mount_point), base_paths
@@ -303,6 +299,63 @@ def hf3fs_native_client(hf3fs_test_base_path):
     # Cleanup test directory if it was created for this test
     if _has_3fs_cluster() and test_dir.exists():
         shutil.rmtree(test_dir, ignore_errors=True)
+
+
+_SMALL_BUFFER_SIZE = 4 * 1024 * 1024
+_SMALL_BUFFER_ENTRIES = 4
+
+
+@pytest.fixture
+def hf3fs_small_buffer_client(hf3fs_test_base_path):
+    """Provide a one-worker LMCacheHf3fsClient with 4 ring entries of 4 MiB.
+
+    One worker runs the whole batch through a single ring. MiB-sized objects
+    exceed one 4 MiB buffer, which splits keys into several I/Os, and batches
+    of more than 4 I/Os make the ring reuse its slots within one batch.
+    """
+    # First Party
+    from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+    test_dir = hf3fs_test_base_path
+    client = LMCacheHf3fsClient(
+        mount_point=str(test_dir.parent),
+        base_paths=str(test_dir),
+        num_workers=1,
+        ior_entries=_SMALL_BUFFER_ENTRIES,
+        single_buffer_size=_SMALL_BUFFER_SIZE,
+        enable_key_buffer=True,
+    )
+    yield client, test_dir
+    client.close()
+    shutil.rmtree(test_dir, ignore_errors=True)
+
+
+_SMALL_RING_ENTRIES = 16
+
+
+@pytest.fixture
+def hf3fs_small_ring_client(hf3fs_test_base_path):
+    """Provide a one-worker LMCacheHf3fsClient with 16 ring entries of 4 MiB.
+
+    A batch of many 4 MiB objects keeps the ring full, so 3FS's in-order
+    release of ring entries is exercised: completions of later I/Os are
+    reaped while earlier ones still hold the entries ahead.
+    """
+    # First Party
+    from lmcache.lmcache_hf3fs import LMCacheHf3fsClient
+
+    test_dir = hf3fs_test_base_path
+    client = LMCacheHf3fsClient(
+        mount_point=str(test_dir.parent),
+        base_paths=str(test_dir),
+        num_workers=1,
+        ior_entries=_SMALL_RING_ENTRIES,
+        single_buffer_size=4 * 1024 * 1024,
+        enable_key_buffer=True,
+    )
+    yield client
+    client.close()
+    shutil.rmtree(test_dir, ignore_errors=True)
 
 
 @pytest.fixture
@@ -339,10 +392,9 @@ class TestHf3fsL2AdapterConfig:
         assert config.mount_point == str(hf3fs_test_mount_point)
         assert config.base_paths == str(hf3fs_test_base_path)
         assert config.num_workers == 4
-        assert config.ior_entries == 256  # default
-        assert config.io_depth == 0  # default
+        assert config.ior_entries == 16  # default
         assert config.numa_id == -1  # default
-        assert config.iov_size == 209715200  # default
+        assert config.single_buffer_size == 8 * 1024 * 1024  # default
 
     def test_invalid_mount_point_not_exists(self):
         """Test validation fails when mount_point doesn't exist."""
@@ -389,11 +441,11 @@ class TestHf3fsL2AdapterConfig:
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
     def test_invalid_ior_entries_range(self, hf3fs_test_base_path):
-        """Test validation fails for ior_entries outside [128, 1024]."""
+        """Test validation fails for ior_entries outside [1, 1024]."""
         config_dict = {
             "mount_point": str(hf3fs_test_base_path.parent),
             "base_paths": str(hf3fs_test_base_path),
-            "ior_entries": 50,
+            "ior_entries": 0,
         }
         with pytest.raises(ValueError, match="range"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
@@ -402,32 +454,32 @@ class TestHf3fsL2AdapterConfig:
         with pytest.raises(ValueError, match="range"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-    def test_invalid_io_depth_range(self, hf3fs_test_base_path):
-        """Test validation fails for io_depth outside [-128, 128]."""
+    def test_removed_keys_are_ignored(self, hf3fs_test_base_path):
+        """A config that still sets removed keys (io_depth, iov_size) loads."""
+        config = Hf3fsL2AdapterConfig.from_dict(
+            {
+                "mount_point": str(hf3fs_test_base_path.parent),
+                "base_paths": str(hf3fs_test_base_path),
+                "io_depth": 16,
+                "iov_size": 209715200,
+            }
+        )
+        assert not hasattr(config, "io_depth")
+        assert not hasattr(config, "iov_size")
+        assert config.single_buffer_size == 8 * 1024 * 1024
+
+    def test_invalid_single_buffer_size(self, hf3fs_test_base_path):
+        """Test validation fails for a non-positive or non-int buffer size."""
         config_dict = {
             "mount_point": str(hf3fs_test_base_path.parent),
             "base_paths": str(hf3fs_test_base_path),
-            "io_depth": -200,
+            "single_buffer_size": 0,
         }
-        with pytest.raises(ValueError, match="range"):
+        with pytest.raises(ValueError, match="positive"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
-        config_dict["io_depth"] = 200
-        with pytest.raises(ValueError, match="range"):
-            Hf3fsL2AdapterConfig.from_dict(config_dict)
-
-    def test_invalid_iov_size_range(self, hf3fs_test_base_path):
-        """Test validation fails for iov_size outside [100MB, 2GB]."""
-        config_dict = {
-            "mount_point": str(hf3fs_test_base_path.parent),
-            "base_paths": str(hf3fs_test_base_path),
-            "iov_size": 50000000,  # 50MB
-        }
-        with pytest.raises(ValueError, match="range"):
-            Hf3fsL2AdapterConfig.from_dict(config_dict)
-
-        config_dict["iov_size"] = 3000000000  # 3GB
-        with pytest.raises(ValueError, match="range"):
+        config_dict["single_buffer_size"] = "8MiB"
+        with pytest.raises(ValueError, match="positive"):
             Hf3fsL2AdapterConfig.from_dict(config_dict)
 
     def test_invalid_num_workers(self, hf3fs_test_base_path):
@@ -457,9 +509,8 @@ class TestHf3fsL2AdapterConfig:
         assert "base_paths" in help_text
         assert "num_workers" in help_text
         assert "ior_entries" in help_text
-        assert "io_depth" in help_text
         assert "numa_id" in help_text
-        assert "iov_size" in help_text
+        assert "single_buffer_size" in help_text
 
 
 # =============================================================================
@@ -613,9 +664,8 @@ class TestHf3fsKeyBufferConfig:
             "base_paths": str(bp),
             "num_workers": 4,
             "ior_entries": 256,
-            "io_depth": 0,
             "numa_id": -1,
-            "iov_size": 209715200,
+            "single_buffer_size": 8 * 1024 * 1024,
         }
         config = Hf3fsL2AdapterConfig.from_dict(d)
         assert config.enable_key_buffer is True
@@ -630,9 +680,8 @@ class TestHf3fsKeyBufferConfig:
             "base_paths": str(bp),
             "num_workers": 4,
             "ior_entries": 256,
-            "io_depth": 0,
             "numa_id": -1,
-            "iov_size": 209715200,
+            "single_buffer_size": 8 * 1024 * 1024,
             "enable_key_buffer": "yes",
         }
         with pytest.raises(ValueError, match="boolean"):
@@ -660,11 +709,7 @@ class TestHf3fsAdapterFactory:
             mount_point=str(hf3fs_test_mount_point),
             base_paths=str(hf3fs_test_base_path),
             num_workers=2,
-            ior_entries=128,
-            io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
-            time_out=200,
             enable_key_buffer=True,
         )
         assert client is not None
@@ -837,11 +882,7 @@ class TestHf3fsNativeConnector:
                 mount_point=str(mp),
                 base_paths=f"{path1},{path2}",
                 num_workers=2,
-                ior_entries=128,
-                io_depth=0,
                 numa_id=-1,
-                iov_size=209715200,
-                time_out=200,
                 enable_key_buffer=True,
             )
 
@@ -897,11 +938,7 @@ class TestHf3fsNativeConnector:
             mount_point=mount_point,
             base_paths=base_paths,
             num_workers=2,
-            ior_entries=128,
-            io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
-            time_out=200,
             enable_key_buffer=True,
         )
 
@@ -957,11 +994,7 @@ class TestHf3fsNativeConnector:
             mount_point=str(mp),
             base_paths=base_paths,
             num_workers=num_workers,
-            ior_entries=128,
-            io_depth=0,
             numa_id=-1,
-            iov_size=209715200,
-            time_out=200,
             enable_key_buffer=True,
         )
         try:
@@ -974,6 +1007,168 @@ class TestHf3fsNativeConnector:
             scanner.close()
             for p in paths:
                 shutil.rmtree(p, ignore_errors=True)
+
+
+def _pattern_bytes(seed: int, size: int) -> bytes:
+    """Return ``size`` bytes that differ per seed and per offset.
+
+    Position-dependent content catches segments written to or read from the
+    wrong file offset, which a constant fill would not.
+    """
+    block = bytes((seed * 31 + j) & 0xFF for j in range(251))
+    return (block * (size // len(block) + 1))[:size]
+
+
+def _roundtrip(client, sizes: list[int], first_id: int = 0) -> None:
+    """Store one key per size in one batch, load them back, and verify data."""
+    keys = [
+        _object_key_to_string(create_object_key(first_id + i))
+        for i in range(len(sizes))
+    ]
+    data = [_pattern_bytes(first_id + i, n) for i, n in enumerate(sizes)]
+
+    client.submit_batch_set(keys, [memoryview(d) for d in data])
+    (completion,) = _wait_for_completions(client)
+    assert completion[1], completion[2]
+
+    bufs = [bytearray(n) for n in sizes]
+    client.submit_batch_get(keys, [memoryview(b) for b in bufs])
+    (completion,) = _wait_for_completions(client)
+    assert completion[3] == [True] * len(sizes)
+    for i, (buf, expected) in enumerate(zip(bufs, data, strict=True)):
+        assert bytes(buf) == expected, f"key {i} data mismatch"
+
+
+@requires_hf3fs_cluster
+class TestHf3fsBatchedRingIO:
+    """Batched get/set through one worker ring with small per-entry buffers.
+
+    A regression that waits on I/O never submitted to the ring blocks the
+    worker forever, so a failure here may show up as a hang rather than an
+    assertion.
+    """
+
+    MiB = 1024 * 1024
+
+    @pytest.mark.parametrize(
+        "sizes",
+        [
+            pytest.param([6 * MiB], id="one-and-a-half-buffers"),
+            pytest.param([8 * MiB], id="exact-multiple-of-buffer"),
+            pytest.param([1 * MiB, 6 * MiB], id="after-small-key"),
+            pytest.param([20 * MiB], id="more-segments-than-slots"),
+        ],
+    )
+    def test_key_larger_than_single_buffer_roundtrip(
+        self, hf3fs_small_buffer_client, sizes
+    ):
+        """A key larger than single_buffer_size is split across I/Os.
+
+        The 20 MiB key needs 5 I/Os on a 4-entry ring, so it waits on its own
+        earlier I/Os for a free slot.
+        """
+        _roundtrip(hf3fs_small_buffer_client[0], sizes)
+
+    def test_batch_larger_than_ring_roundtrip(self, hf3fs_small_buffer_client):
+        """A batch of 3x the ring's entries round-trips as slots are reused."""
+        _roundtrip(hf3fs_small_buffer_client[0], [1 * self.MiB] * 12)
+
+    def test_unaligned_sizes_roundtrip(self, hf3fs_small_buffer_client):
+        """Odd-sized objects in their own slot buffers keep their own data."""
+        sizes = [1, 4097, 1 * self.MiB + 7, 3 * self.MiB - 1, 123457]
+        _roundtrip(hf3fs_small_buffer_client[0], sizes)
+
+    def test_batch_get_missing_key_fails_only_that_key(self, hf3fs_small_buffer_client):
+        """A missing key in a batch load fails alone; the others load intact."""
+        client = hf3fs_small_buffer_client[0]
+        keys = [_object_key_to_string(create_object_key(i)) for i in range(5)]
+        data = [_pattern_bytes(i, 1 * self.MiB) for i in range(5)]
+        present = [0, 1, 3, 4]
+
+        client.submit_batch_set(
+            [keys[i] for i in present], [memoryview(data[i]) for i in present]
+        )
+        (completion,) = _wait_for_completions(client)
+        assert completion[1], completion[2]
+
+        bufs = [bytearray(1 * self.MiB) for _ in keys]
+        client.submit_batch_get(keys, [memoryview(b) for b in bufs])
+        (completion,) = _wait_for_completions(client)
+        assert completion[3] == [True, True, False, True, True]
+        for i in present:
+            assert bytes(bufs[i]) == data[i], f"key {i} data mismatch"
+
+        # The worker's ring stays usable after a batch with a failed key.
+        _roundtrip(client, [2 * self.MiB] * 3, first_id=100)
+
+    def test_batch_get_short_read_fails_only_that_key(
+        self, hf3fs_small_buffer_client, capfd
+    ):
+        """Loading more bytes than were stored is reported as a short read."""
+        client = hf3fs_small_buffer_client[0]
+        keys = [_object_key_to_string(create_object_key(i)) for i in range(3)]
+        data = [_pattern_bytes(i, 1 * self.MiB) for i in range(3)]
+        client.submit_batch_set(keys, [memoryview(d) for d in data])
+        (completion,) = _wait_for_completions(client)
+        assert completion[1], completion[2]
+
+        sizes = [1 * self.MiB, 2 * self.MiB, 1 * self.MiB]
+        bufs = [bytearray(n) for n in sizes]
+        client.submit_batch_get(keys, [memoryview(b) for b in bufs])
+        (completion,) = _wait_for_completions(client)
+        assert completion[3] == [True, False, True]
+        assert bytes(bufs[0]) == data[0]
+        assert bytes(bufs[2]) == data[2]
+        err = capfd.readouterr().err
+        assert f"short: requested {2 * self.MiB} but got {1 * self.MiB}" in err
+
+    def test_full_ring_roundtrip(self, hf3fs_small_ring_client):
+        """A batch that keeps the ring full stores and loads every key.
+
+        3FS frees ring entries in order, so a full ring can reject a new I/O
+        even after later completions were reaped; that must delay the I/O,
+        not fail the batch.
+        """
+        for round_idx in range(3):
+            _roundtrip(
+                hf3fs_small_ring_client,
+                [4 * self.MiB] * 128,
+                first_id=round_idx * 128,
+            )
+
+    def test_batch_set_failure_stores_other_keys(self, hf3fs_small_buffer_client):
+        """A key that cannot be written fails the batch but not its neighbours."""
+        client, base_dir = hf3fs_small_buffer_client
+        keys = [_object_key_to_string(create_object_key(i)) for i in range(5)]
+        data = [_pattern_bytes(i, 1 * self.MiB) for i in range(5)]
+
+        # Learn key 2's file name, then put a directory in its place so the
+        # open for write fails.
+        client.submit_batch_set([keys[2]], [memoryview(data[2])])
+        _wait_for_completions(client)
+        (path,) = base_dir.iterdir()
+        client.submit_batch_delete([keys[2]])
+        _wait_for_completions(client)
+        path.mkdir()
+
+        client.submit_batch_set(keys, [memoryview(d) for d in data])
+        (completion,) = _wait_for_completions(client)
+        assert not completion[1]
+        assert "1 of 5 keys failed" in completion[2]
+
+        client.submit_batch_exists(keys)
+        (completion,) = _wait_for_completions(client)
+        assert completion[3] == [True, True, False, True, True]
+
+        others = [0, 1, 3, 4]
+        bufs = [bytearray(1 * self.MiB) for _ in others]
+        client.submit_batch_get(
+            [keys[i] for i in others], [memoryview(b) for b in bufs]
+        )
+        (completion,) = _wait_for_completions(client)
+        assert completion[3] == [True] * 4
+        for i, buf in zip(others, bufs, strict=True):
+            assert bytes(buf) == data[i], f"key {i} data mismatch"
 
 
 @requires_hf3fs_cluster

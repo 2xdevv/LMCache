@@ -80,13 +80,14 @@ The **BUILD_HF3FS** environment variable controls compilation:
 - ``mount_point`` (str, required): 3FS mount point directory.
 - ``base_paths`` (str, required): Comma-separated subdirectories under
   ``mount_point``.
-- ``ior_entries`` (int, default ``256``, range ``[128, 1024]``): Max
-  concurrent requests per Ior.
-- ``io_depth`` (int, default ``0``, range ``[-128, 128]``): Batch control
-  parameter.
+- ``ior_entries`` (int, default ``16``, range ``[1, 1024]``): Max I/Os a
+  worker keeps in its ring at once (see *Batched I/O*).
 - ``numa_id`` (int, default ``-1``): NUMA node ID (``-1`` = current node).
-- ``iov_size`` (int, default ``209715200`` (200 MB), range
-  ``[104857600, 2147483648]``): Per-thread I/O buffer in bytes.
+- ``single_buffer_size`` (int, default ``8388608`` (8 MiB), ``> 0``): Bytes
+  of I/O buffer per ring entry, and the largest single I/O; larger keys are
+  split into several I/Os.  Each worker allocates a read and a write buffer
+  of ``single_buffer_size * ior_entries`` bytes each, so the defaults use
+  256 MiB of shared memory per worker.
 - ``enable_key_buffer`` (bool, default ``True``): Enable the in-memory
   key buffer for accelerated exists lookups.  When enabled, exist lookups
   respond from a hash set instead of issuing remote 3FS metadata calls.
@@ -100,10 +101,9 @@ The **BUILD_HF3FS** environment variable controls compilation:
       "type": "hf3fs",
       "mount_point": "/3fs/stage",
       "base_paths": "/3fs/stage/path1,/3fs/stage/path2",
-      "ior_entries": 256,
-      "io_depth": 0,
+      "ior_entries": 16,
       "numa_id": -1,
-      "iov_size": 209715200,
+      "single_buffer_size": 8388608,
       "enable_key_buffer": true,
       "num_workers": 4,
       "per_op_workers": {
@@ -113,6 +113,41 @@ The **BUILD_HF3FS** environment variable controls compilation:
       }
     }'
 
+
+**Batched I/O**
+
+Each worker owns one read ring and one write ring (Usrbio ``Ior``), each
+backed by its own ``Iov`` buffer.  The ``Iov`` is ``ior_entries`` fixed buffers
+of ``single_buffer_size`` bytes, one per ring entry.  Instead of issuing one
+I/O per key and waiting for it, a worker runs its share of a batch as a
+bounded pipeline:
+
+1. Open and register (``hf3fs_reg_fd``) the next key's file and prepare its
+   I/O in a free ring entry, using that entry's buffer (keys larger than
+   ``single_buffer_size`` are split into several I/Os).
+2. Submit immediately (``hf3fs_submit_ios``) and keep preparing further keys
+   while the ring holds fewer than ``ior_entries`` I/Os.  When it is full,
+   wait for one completion and reuse its entry and buffer.
+3. Reap completions as they arrive.  A read's data is copied out of the
+   ``Iov`` as soon as its I/O lands, so the copy overlaps the I/Os still in
+   flight instead of waiting for the whole batch.
+4. Deregister and close each file once its last I/O has completed.
+
+Every ring is created with 3FS ``io_depth`` ``0``, so the 3FS ring worker
+starts each I/O as soon as it sees it.  This is not configurable: a non-zero
+``io_depth`` holds back batches smaller than ``|io_depth|``, and 3FS re-checks a
+held-back batch only when a later submit wakes its ring watcher, so the last
+request before the client goes idle would never complete.
+
+For example, with the defaults and 8 MiB KV chunks, a worker keeps 16 chunks
+in flight and starts the next one as soon as any of them completes, where the
+earlier design waited on each chunk before starting the next.  Because each
+entry owns its buffer, a completed I/O frees its buffer immediately, even
+when it finishes before earlier ones.
+
+A failed key does not stop the rest of the batch: a load reports only that
+key as missing, and a store still writes every other key but reports the
+batch as failed.
 
 **In-Memory Key Buffer**
 
@@ -133,10 +168,9 @@ To disable the buffer cache:
       "type": "hf3fs",
       "mount_point": "/3fs/stage",
       "base_paths": "/3fs/stage/path1",
-      "ior_entries": 256,
-      "io_depth": 0,
+      "ior_entries": 16,
       "numa_id": -1,
-      "iov_size": 209715200,
+      "single_buffer_size": 8388608,
       "enable_key_buffer": false,
     }'
 

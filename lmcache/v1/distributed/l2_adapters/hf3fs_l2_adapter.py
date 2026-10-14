@@ -51,10 +51,11 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
     - mount_point: 3FS mount point directory (required).
     - base_paths: Comma-separated subdirectories under mount_point (required).
     - num_workers: C++ worker threads for I/O (default 4).
-    - ior_entries: Max concurrent requests per Ior (default 256, range [128, 1024]).
-    - io_depth: Batch control parameter (default 0, range [-128, 128]).
+    - ior_entries: Max I/Os in flight per worker ring (default 16, range [1, 1024]).
     - numa_id: NUMA node ID (default -1 = current node).
-    - iov_size: Per-thread I/O buffer in bytes (default 200MB, range [100MB, 2GB]).
+    - single_buffer_size: Bytes of I/O buffer per ring entry, and the largest
+        single I/O (default 8 MiB). Each worker's read and write buffers are
+        single_buffer_size * ior_entries bytes each.
     - enable_key_buffer (bool): Enable in-memory key buffer for accelerated
         exists lookups. When enabled, do_batch_exists() uses a pre-scanned
         hash set instead of filesystem calls. Default: True.
@@ -69,10 +70,9 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
         mount_point: str,
         base_paths: str,
         num_workers: int = 4,
-        ior_entries: int = 256,
-        io_depth: int = 0,
+        ior_entries: int = 16,
         numa_id: int = -1,
-        iov_size: int = 209715200,
+        single_buffer_size: int = 8 * 1024 * 1024,
         enable_key_buffer: bool = True,
         per_op_workers: dict[str, int] | None = None,
     ):
@@ -80,9 +80,8 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
         self.base_paths = base_paths
         self.num_workers = L2AdapterConfigBase._validate_num_workers(num_workers)
         self.ior_entries = ior_entries
-        self.io_depth = io_depth
         self.numa_id = numa_id
-        self.iov_size = iov_size
+        self.single_buffer_size = single_buffer_size
         self.enable_key_buffer = enable_key_buffer
         self.per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
             per_op_workers
@@ -130,21 +129,17 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(num_workers, int) or num_workers <= 0:
             raise ValueError("num_workers must be a positive integer")
 
-        ior_entries = d.get("ior_entries", 256)
-        if not isinstance(ior_entries, int) or not (128 <= ior_entries <= 1024):
-            raise ValueError("ior_entries must be in range [128, 1024]")
-
-        io_depth = d.get("io_depth", 0)
-        if not isinstance(io_depth, int) or not (-128 <= io_depth <= 128):
-            raise ValueError("io_depth must be in range [-128, 128]")
+        ior_entries = d.get("ior_entries", 16)
+        if not isinstance(ior_entries, int) or not (1 <= ior_entries <= 1024):
+            raise ValueError("ior_entries must be in range [1, 1024]")
 
         numa_id = d.get("numa_id", -1)
         if not isinstance(numa_id, int):
             raise ValueError("numa_id must be an integer")
 
-        iov_size = d.get("iov_size", 209715200)
-        if not isinstance(iov_size, int) or not (104857600 <= iov_size <= 2147483648):
-            raise ValueError("iov_size must be in range [100MB, 2GB]")
+        single_buffer_size = d.get("single_buffer_size", 8 * 1024 * 1024)
+        if not isinstance(single_buffer_size, int) or single_buffer_size <= 0:
+            raise ValueError("single_buffer_size must be a positive integer")
 
         enable_key_buffer = d.get("enable_key_buffer", True)
         if not isinstance(enable_key_buffer, bool):
@@ -157,9 +152,8 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
             base_paths=base_paths,
             num_workers=num_workers,
             ior_entries=ior_entries,
-            io_depth=io_depth,
             numa_id=numa_id,
-            iov_size=iov_size,
+            single_buffer_size=single_buffer_size,
             enable_key_buffer=enable_key_buffer,
             per_op_workers=per_op_workers,
         )
@@ -172,13 +166,11 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
             "- base_paths (str): Comma-separated subdirectories under "
             "mount_point (required)\n"
             "- num_workers (int): C++ worker threads (default 4, >0)\n"
-            "- ior_entries (int): Max concurrent requests per Ior "
-            "(default 256, range [128, 1024])\n"
-            "- io_depth (int): Batch control parameter "
-            "(default 0, range [-128, 128])\n"
+            "- ior_entries (int): Max I/Os in flight per worker ring "
+            "(default 16, range [1, 1024])\n"
             "- numa_id (int): NUMA node ID (default -1 = current node)\n"
-            "- iov_size (int): Per-thread I/O buffer in bytes "
-            "(default 200MB, range [100MB, 2GB])\n"
+            "- single_buffer_size (int): Bytes of I/O buffer per ring entry, "
+            "and the largest single I/O (default 8 MiB, >0)\n"
             "- enable_key_buffer (bool): Enable in-memory key buffer for "
             "accelerated exists lookups (default True)\n"
             "- per_op_workers (dict[str, int] | None): Optional dict mapping "
@@ -216,10 +208,8 @@ def _create_hf3fs_l2_adapter(
         config.base_paths,
         config.num_workers,
         config.ior_entries,
-        config.io_depth,
         config.numa_id,
-        config.iov_size,
-        time_out=200,
+        config.single_buffer_size,
         enable_key_buffer=config.enable_key_buffer,
         per_op_workers=config.per_op_workers,
     )
@@ -237,7 +227,6 @@ def _create_hf3fs_l2_adapter(
             "base_paths": config.base_paths,
             "num_workers": config.num_workers,
             "ior_entries": config.ior_entries,
-            "io_depth": config.io_depth,
             "per_op_workers": config.per_op_workers,
         },
     )
