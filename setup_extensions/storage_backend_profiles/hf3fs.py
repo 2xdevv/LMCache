@@ -32,39 +32,46 @@ class Hf3fsStorageBackend(StorageBackendProfile):
     name = "hf3fs"
     env_var = "BUILD_WITH_HF3FS"
 
-    def detect(self) -> bool:
-        """Detect HF3FS SDK via ``HF3FS_INCLUDE_DIR`` / ``HF3FS_LIB_DIR``.
+    #: Compiler default include dirs searched for Abseil (libabsl-dev
+    #: installs into ``/usr/include``) after ``HF3FS_INCLUDE_DIR``.
+    system_include_dirs: tuple[str, ...] = ("/usr/local/include", "/usr/include")
 
-        Verifies both the Abseil header and shared library are present.
+    def detect(self) -> bool:
+        """Detect HF3FS SDK via ``BUILD_HF3FS`` / ``HF3FS_INCLUDE_DIR``.
+
+        ``BUILD_HF3FS=0`` disables the build. ``BUILD_HF3FS=1``, or a
+        non-empty ``HF3FS_INCLUDE_DIR`` when ``BUILD_HF3FS`` is unset,
+        enables it if the Abseil header and shared library are present.
+
+        Returns:
+            ``True`` if the HF3FS extension should be built.
         """
         hf3fs_env = os.environ.get("BUILD_HF3FS")
         if hf3fs_env == "0":
             return False
 
-        if hf3fs_env == "1":
-            if self._check_absl_available():
-                return True
-
-            # Abseil missing
-            print("[HF3FS] WARNING: BUILD_HF3FS=1 set but Abseil not available !!!")
-            print(
-                "[HF3FS] WARNING: unset BUILD_HF3FS or install libabsl-dev:"
-                " sudo apt-get install -y libabsl-dev "
-            )
+        if hf3fs_env is None and not os.environ.get("HF3FS_INCLUDE_DIR"):
             return False
 
-        # Not explicitly enabled - auto-detect skips
+        if self._check_absl_available():
+            return True
+
+        print("[HF3FS] WARNING: HF3FS build requested but Abseil not available !!!")
+        print(
+            "[HF3FS] WARNING: unset BUILD_HF3FS or install libabsl-dev:"
+            " sudo apt-get install -y libabsl-dev "
+        )
         return False
 
-    @staticmethod
-    def _check_absl_available() -> bool:
+    def _check_absl_available(self) -> bool:
         """Check if Abseil headers and shared libraries are available.
 
         Returns:
             ``True`` if ``absl_hash`` shared library is findable via
             :func:`ctypes.util.find_library` AND the
-            ``flat_hash_set.h`` header is present under
-            ``HF3FS_INCLUDE_DIR`` (default ``/usr/include``).
+            ``flat_hash_set.h`` header is present under one of the
+            ``;``-separated ``HF3FS_INCLUDE_DIR`` entries or
+            :attr:`system_include_dirs`.
         """
         # Standard
         import ctypes.util
@@ -74,14 +81,22 @@ class Hf3fsStorageBackend(StorageBackendProfile):
             print("[HF3FS] WARNING: Abseil library (libabsl-dev) not found !!!")
             return False
 
-        # 2. Check header file
-        include_dir = os.environ.get("HF3FS_INCLUDE_DIR", "/usr/include")
-        header_path = os.path.join(include_dir, "absl", "container", "flat_hash_set.h")
-        if not os.path.isfile(header_path):
-            print(f"[HF3FS] WARNING: Abseil header not found at {include_dir}. !!!")
-            return False
+        # 2. Check header file. HF3FS_INCLUDE_DIR usually points at the 3FS
+        # usrbio headers, so the system dirs must be searched as well.
+        hf3fs_include = os.environ.get("HF3FS_INCLUDE_DIR", "")
+        include_dirs = [d for d in hf3fs_include.split(";") if d]
+        include_dirs.extend(self.system_include_dirs)
+        for include_dir in include_dirs:
+            header_path = os.path.join(
+                include_dir, "absl", "container", "flat_hash_set.h"
+            )
+            if os.path.isfile(header_path):
+                return True
 
-        return True
+        print(
+            f"[HF3FS] WARNING: Abseil header not found in {', '.join(include_dirs)} !!!"
+        )
+        return False
 
     def build(self, extra_cxx_flags: list[str]) -> list["Extension"]:
         """Build the ``lmcache.lmcache_hf3fs`` CppExtension.
