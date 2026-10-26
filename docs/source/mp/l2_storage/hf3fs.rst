@@ -114,6 +114,17 @@ The **BUILD_HF3FS** environment variable controls compilation:
     }'
 
 
+**Batched Stores**
+
+A worker stores its share of a batch in waves instead of one
+open/submit/wait/close round trip per key.  A wave packs consecutive keys'
+data back to back into the write ``Iov``, up to ``ior_entries`` I/Os or
+``iov_size`` bytes, submits them with one ``hf3fs_submit_ios`` call, and waits
+for all of them before the next wave starts.  A key that does not fit in the
+rest of a wave continues in the next one, and its file stays registered until
+its last I/O completes.  A failed key does not stop the others; the store
+reports how many keys failed and the first error.
+
 **In-Memory Key Buffer**
 
 When ``enable_key_buffer`` is ``True`` (the default), the connector maintains an

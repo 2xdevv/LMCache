@@ -794,6 +794,26 @@ class TestHf3fsNativeConnector:
         for i, (expected, buf) in enumerate(zip(data_list, buffers, strict=False)):
             assert bytes(buf) == expected, f"Key {i} mismatch"
 
+    def test_batch_put_get_spans_multiple_write_waves(self, hf3fs_native_client):
+        """A batch with more keys than ior_entries is stored in several waves.
+
+        The fixture ring holds 128 entries, so 300 keys of distinct sizes and
+        contents need at least three waves; each must read back intact.
+        """
+        client = hf3fs_native_client[0]
+        keys = [_object_key_to_string(create_object_key(1000 + i)) for i in range(300)]
+        data_list = [bytes([i % 251]) * (512 + 7 * i) for i in range(300)]
+
+        client.submit_batch_set(keys, [memoryview(d) for d in data_list])
+        _wait_for_completions(client)
+
+        buffers = [bytearray(len(d)) for d in data_list]
+        client.submit_batch_get(keys, [memoryview(b) for b in buffers])
+        _wait_for_completions(client)
+
+        for i, (expected, buf) in enumerate(zip(data_list, buffers, strict=False)):
+            assert bytes(buf) == expected, f"Key {i} mismatch"
+
     def test_exists_check(self, hf3fs_native_client):
         """Test exists() for existing and non-existing keys."""
         client = hf3fs_native_client[0]

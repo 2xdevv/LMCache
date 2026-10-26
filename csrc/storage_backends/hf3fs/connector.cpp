@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <limits.h>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <sstream>
@@ -18,6 +19,65 @@
 
 namespace lmcache {
 namespace connector {
+
+namespace {
+
+/**
+ * A unique temporary file next to a final path, opened for writing and
+ * registered with 3FS, released on destruction.
+ *
+ * The caller renames temp_path() to the final path once every I/O to it
+ * succeeded, or unlinks it, so readers never see a partial file.
+ */
+class RegisteredFile {
+ public:
+  explicit RegisteredFile(const std::string& final_path) {
+    std::random_device random;
+    do {
+      // O_EXCL prevents collisions across workers, processes, and hosts.
+      temp_path_ = final_path + "." + std::to_string(random());
+      fd_ = ::open(temp_path_.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    } while (fd_ < 0 && errno == EEXIST);
+    if (fd_ < 0) {
+      throw std::runtime_error("open failed: " + std::string(strerror(errno)));
+    }
+    int reg_result = hf3fs_reg_fd(fd_, 0);
+    if (reg_result > 0) {
+      ::close(fd_);
+      if (::unlink(temp_path_.c_str()) < 0) {
+        fprintf(stderr, "[LMCache HF3FS] Remove temporary file %s failed: %s\n",
+                temp_path_.c_str(), strerror(errno));
+      }
+      throw std::runtime_error(
+          "hf3fs_reg_fd failed: " + std::to_string(reg_result) +
+          " (errno=" + strerror(reg_result) + ")");
+    }
+  }
+  ~RegisteredFile() {
+    hf3fs_dereg_fd(fd_);
+    ::close(fd_);
+  }
+  RegisteredFile(const RegisteredFile&) = delete;
+  RegisteredFile& operator=(const RegisteredFile&) = delete;
+
+  int fd() const { return fd_; }
+  const std::string& temp_path() const { return temp_path_; }
+
+ private:
+  int fd_ = -1;
+  std::string temp_path_;
+};
+
+/**
+ * One write of a wave: len bytes at file_off of keys[key_idx].
+ */
+struct Segment {
+  size_t key_idx;
+  size_t file_off;
+  size_t len;
+};
+
+}  // namespace
 
 /**
  * Construct a new Hf3fsConnector.
@@ -532,6 +592,173 @@ void Hf3fsConnector::do_single_set(WorkerHf3fsConn& conn,
   }
   if (buffer_enabled_) {
     buffer_add_(key);
+  }
+}
+
+/**
+ * Store a tile of keys in write waves.
+ *
+ * A wave packs consecutive keys' data back to back into the write Iov, up to
+ * ior_entries_ segments or iov_size_ bytes, preps them all, submits them
+ * together, and waits for all of them before the next wave starts. A key that
+ * does not fit in the rest of a wave continues in the next one, and its file
+ * stays registered until the wave holding its last segment completes. Each
+ * key is written to a temporary file that is renamed to its final path once
+ * all of its I/Os succeed, so readers never see a partial file. This
+ * replaces one open/submit/wait/close round trip per key.
+ *
+ * A key that fails to open or whose I/O fails does not stop the others. If the
+ * ring itself fails (prep, submit, or wait returns an error), keys whose last
+ * wave completed keep their result and every other key is failed with the
+ * ring error. Successfully written keys are added to the key buffer even when
+ * others in the tile fail.
+ *
+ * @param conn Connection to use
+ * @param req Tile request
+ * @throws std::runtime_error if any key fails, naming the first failure
+ */
+void Hf3fsConnector::do_batch_set(WorkerHf3fsConn& conn, const Request& req) {
+  const size_t n = req.keys.size();
+  std::vector<std::string> errors(n);
+  const size_t cap = static_cast<size_t>(ior_entries_);
+  // A segment's index in the wave is its userdata.
+  std::vector<Segment> wave;
+  wave.reserve(cap);
+  std::vector<hf3fs_cqe> cqes(cap);
+  // Declared outside the try so files stay registered until the ring error
+  // path has finished.
+  std::vector<std::optional<RegisteredFile>> files(n);
+  size_t next_key = 0;
+  size_t next_off = 0;
+  // Keys before done_keys have had every segment complete.
+  size_t done_keys = 0;
+
+  // Close a key's file, then publish it by renaming the temporary file to the
+  // final path if every I/O succeeded, or remove it otherwise.
+  auto finish_key = [&](size_t k) {
+    if (!files[k]) {
+      return;
+    }
+    const std::string temp_path = files[k]->temp_path();
+    files[k].reset();
+    if (errors[k].empty()) {
+      try {
+        std::filesystem::rename(temp_path, key_to_path(req.keys[k]));
+        return;
+      } catch (const std::exception& e) {
+        errors[k] = e.what();
+      }
+    }
+    if (::unlink(temp_path.c_str()) < 0) {
+      fprintf(stderr, "[LMCache HF3FS] Remove temporary file %s failed: %s\n",
+              temp_path.c_str(), strerror(errno));
+    }
+  };
+
+  try {
+    while (next_key < n) {
+      wave.clear();
+      size_t used = 0;
+      while (wave.size() < cap && used < iov_size_ && next_key < n) {
+        const size_t i = next_key;
+        const size_t len = req.buf_lens[i];
+        if (next_off == 0) {
+          try {
+            files[i].emplace(key_to_path(req.keys[i]));
+          } catch (const std::exception& e) {
+            errors[i] = e.what();
+            ++next_key;
+            continue;
+          }
+          if (len == 0) {
+            ++next_key;
+            continue;
+          }
+        }
+        const size_t sub_len = std::min(len - next_off, iov_size_ - used);
+        uint8_t* ptr = conn.write_iov.base + used;
+        memcpy(ptr, static_cast<const char*>(req.buf_ptrs[i]) + next_off,
+               sub_len);
+        int ret = hf3fs_prep_io(&conn.write_ior, &conn.write_iov, false, ptr,
+                                files[i]->fd(), next_off, sub_len,
+                                reinterpret_cast<const void*>(wave.size()));
+        if (ret < 0) {
+          throw std::runtime_error("hf3fs_prep_io failed: " +
+                                   std::to_string(-ret));
+        }
+        wave.push_back({i, next_off, sub_len});
+        used += sub_len;
+        next_off += sub_len;
+        if (next_off == len) {
+          ++next_key;
+          next_off = 0;
+        }
+      }
+
+      if (!wave.empty()) {
+        int ret = hf3fs_submit_ios(&conn.write_ior);
+        if (ret < 0) {
+          throw std::runtime_error("hf3fs_submit_ios failed: " +
+                                   std::to_string(-ret));
+        }
+        // Completions arrive in any order; userdata maps each to its segment.
+        size_t reaped = 0;
+        while (reaped < wave.size()) {
+          int got = hf3fs_wait_for_ios(
+              &conn.write_ior, cqes.data(), static_cast<int>(cap),
+              static_cast<int>(wave.size() - reaped), nullptr);
+          if (got < 0) {
+            throw std::runtime_error("hf3fs_wait_for_ios failed: " +
+                                     std::to_string(-got));
+          }
+          for (int c = 0; c < got; ++c) {
+            const Segment& seg =
+                wave[reinterpret_cast<uintptr_t>(cqes[c].userdata)];
+            std::string& err = errors[seg.key_idx];
+            const int64_t result = cqes[c].result;
+            if (result != static_cast<int64_t>(seg.len) && err.empty()) {
+              err = "write (" + key_to_path(req.keys[seg.key_idx]) + ") ";
+              if (result < 0) {
+                err += "I/O failed: " + std::to_string(-result);
+              } else {
+                err += "short: requested " + std::to_string(seg.len) +
+                       " but got " + std::to_string(result);
+              }
+            }
+          }
+          reaped += static_cast<size_t>(got);
+        }
+      }
+
+      // Every key before the cursor has now had all of its segments complete.
+      for (; done_keys < next_key; ++done_keys) {
+        finish_key(done_keys);
+      }
+    }
+  } catch (const std::exception& e) {
+    for (size_t k = done_keys; k < n; ++k) {
+      if (errors[k].empty()) {
+        errors[k] = e.what();
+      }
+      finish_key(k);
+    }
+  }
+
+  size_t num_failed = 0;
+  const std::string* first_error = nullptr;
+  for (size_t i = 0; i < n; ++i) {
+    if (errors[i].empty()) {
+      if (buffer_enabled_) {
+        buffer_add_(req.keys[i]);
+      }
+    } else if (num_failed++ == 0) {
+      first_error = &errors[i];
+    }
+  }
+  if (num_failed > 0) {
+    throw std::runtime_error(std::to_string(num_failed) + " of " +
+                             std::to_string(n) +
+                             " keys failed to store, first: " + *first_error);
   }
 }
 

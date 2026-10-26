@@ -153,6 +153,7 @@ class Hf3fsConnector : public ConnectorBase<WorkerHf3fsConn> {
                      size_t len, size_t chunk_size) override;
   void do_single_set(WorkerHf3fsConn& conn, const std::string& key,
                      const void* buf, size_t len, size_t chunk_size) override;
+  void do_batch_set(WorkerHf3fsConn& conn, const Request& req) override;
   bool do_single_exists(WorkerHf3fsConn& conn, const std::string& key) override;
   bool do_single_delete(WorkerHf3fsConn& conn, const std::string& key) override;
   void do_batch_exists(WorkerHf3fsConn& conn, const Request& req) override;
