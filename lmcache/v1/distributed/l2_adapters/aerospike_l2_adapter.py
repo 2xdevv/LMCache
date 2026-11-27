@@ -21,6 +21,8 @@ from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -44,6 +46,8 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
     - max_record_bytes: override server record cap (0 = discover)
     - username / password: optional EE auth
     - max_capacity_gb: L2 capacity tracking (0 = disabled)
+    - stall_warn_seconds: warn when a connector worker spends this long on
+      one key or on connection setup (default 90 s, 0 disables).
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
         username: str = "",
         password: str = "",
         max_capacity_gb: float = 0,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ) -> None:
         super().__init__()
         self.hosts = hosts
@@ -74,6 +79,7 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
         self.username = username
         self.password = password
         self.max_capacity_gb = max_capacity_gb
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict) -> "AerospikeL2AdapterConfig":
@@ -138,6 +144,8 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
+
         return cls(
             hosts=hosts,
             namespace=str(namespace),
@@ -151,6 +159,7 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
             username=str(username),
             password=str(password),
             max_capacity_gb=float(max_capacity_gb),
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -168,7 +177,9 @@ class AerospikeL2AdapterConfig(L2AdapterConfigBase):
             "- target_segment_bytes (int): shard target, 0 = auto (default 0)\n"
             "- max_record_bytes (int): cap override, 0 = discover (default 0)\n"
             "- username / password (str): optional auth\n"
-            "- max_capacity_gb (float): L2 capacity for eviction (default 0)\n\n"
+            "- max_capacity_gb (float): L2 capacity for eviction (default 0)\n"
+            + STALL_WARN_SECONDS_HELP
+            + "\n\n"
             "Environment variable defaults (when config value is empty):\n"
             "- LMCACHE_AEROSPIKE_HOSTS\n"
             "- LMCACHE_AEROSPIKE_NAMESPACE\n"
@@ -235,6 +246,7 @@ def _create_aerospike_l2_adapter(
         native_client,
         MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
         max_capacity_gb=config.max_capacity_gb,
+        stall_warn_seconds=config.stall_warn_seconds,
         type_name="aerospike",
         extra_status={
             "hosts": hosts,

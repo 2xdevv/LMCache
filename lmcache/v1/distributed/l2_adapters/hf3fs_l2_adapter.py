@@ -27,6 +27,8 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -69,6 +71,8 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
                 (``"lookup"``, ``"retrieve"``, ``"store"``,
                 ``"delete"``) to dedicated worker counts.  Ops
                 not mentioned use the shared ``num_workers`` pool.
+    - stall_warn_seconds (float): Warn when a connector worker spends this
+        long on one key or on connection setup. Default 90; 0 disables.
     """
 
     def __init__(
@@ -83,6 +87,7 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
         enable_key_buffer: bool = True,
         shard_dirs: bool = False,
         per_op_workers: dict[str, int] | None = None,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ):
         self.mount_point = mount_point
         self.base_paths = base_paths
@@ -96,6 +101,7 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
         self.per_op_workers = L2AdapterConfigBase._validate_per_op_workers(
             per_op_workers
         )
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict) -> "Hf3fsL2AdapterConfig":
@@ -164,6 +170,7 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("shard_dirs must be a boolean")
 
         per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
 
         return cls(
             mount_point=mount_point,
@@ -176,6 +183,7 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
             enable_key_buffer=enable_key_buffer,
             shard_dirs=shard_dirs,
             per_op_workers=per_op_workers,
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -201,7 +209,7 @@ class Hf3fsL2AdapterConfig(L2AdapterConfigBase):
             "- per_op_workers (dict[str, int] | None): Optional dict mapping "
             "lane keys to dedicated worker counts. Valid keys: lookup, "
             "retrieve, store, delete. Ops not mentioned use the shared "
-            "num_workers pool."
+            "num_workers pool.\n" + STALL_WARN_SECONDS_HELP
         )
 
 
@@ -251,6 +259,7 @@ def _create_hf3fs_l2_adapter(
         native_client,
         MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
         type_name="Hf3fsL2Adapter",
+        stall_warn_seconds=config.stall_warn_seconds,
         extra_status={
             "mount_point": config.mount_point,
             "base_paths": config.base_paths,

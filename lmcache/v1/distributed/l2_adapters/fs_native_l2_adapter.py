@@ -24,6 +24,8 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -80,6 +82,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
       the adapter spec also carries an ``eviction`` block, e.g.
       ``{"eviction": {"eviction_policy": "LRU"}}``. Without one,
       files accumulate past the declared capacity.
+    - stall_warn_seconds: warn when a connector worker spends this long on
+      one key or on connection setup (default 90 s, 0 disables).
     """
 
     def __init__(
@@ -92,6 +96,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         max_capacity_gb: float = 0,
         num_read_workers: int = DEFAULT_NUM_READ_WORKERS,
         read_max_bytes_in_flight: int = 0,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ):
         """Build the config; see the class docstring for each field.
 
@@ -105,6 +110,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
         self.use_odirect = use_odirect
         self.read_ahead_size = read_ahead_size
         self.max_capacity_gb = max_capacity_gb
+        self.stall_warn_seconds = stall_warn_seconds
         self.num_read_workers = _validate_non_negative_int(
             "num_read_workers", num_read_workers
         )
@@ -155,6 +161,8 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
                 base_path,
             )
 
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
+
         return cls(
             base_path=base_path,
             num_workers=num_workers,
@@ -164,6 +172,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             max_capacity_gb=float(max_capacity_gb),
             num_read_workers=d.get("num_read_workers", DEFAULT_NUM_READ_WORKERS),
             read_max_bytes_in_flight=d.get("read_max_bytes_in_flight", 0),
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -190,7 +199,7 @@ class FSNativeL2AdapterConfig(L2AdapterConfigBase):
             "- max_capacity_gb (float): declared L2 capacity in GB "
             "for usage accounting (default 0 = disabled). Does not "
             "bound disk usage by itself; add an 'eviction' block "
-            "to enforce it"
+            "to enforce it\n" + STALL_WARN_SECONDS_HELP
         )
 
 
@@ -247,6 +256,7 @@ def _create_fs_native_l2_adapter(
         max_capacity_gb=config.max_capacity_gb,
         type_name="FSNativeL2Adapter",
         pad_buffers_to_alignment=config.use_odirect,
+        stall_warn_seconds=config.stall_warn_seconds,
         extra_status={
             "base_path": config.base_path,
             "use_odirect": config.use_odirect,

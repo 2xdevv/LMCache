@@ -26,6 +26,9 @@ I/O queue depth on a single Python thread.
   for reads that use ``O_DIRECT`` because direct I/O bypasses the page cache.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB
   for client-side usage tracking.  Default ``0`` disables tracking.
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one key or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
 - ``num_read_workers`` (int, default ``256``): Threads that run lookups
   and reads, and so the maximum reads in flight.  Lookups and reads go
   straight to these threads, so they do not queue behind writes on the

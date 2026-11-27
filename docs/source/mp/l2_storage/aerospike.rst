@@ -43,6 +43,9 @@ the ``aerospike-client-c.env`` example.
   Edition authentication.
 - ``max_capacity_gb`` (float, default ``0``): Maximum L2 capacity in GB for
   client-side usage tracking / eviction.  ``0`` disables tracking.
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one key or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
 
 **Environment variable fallbacks.**  When the corresponding config value is
 empty, these environment variables are used: ``LMCACHE_AEROSPIKE_HOSTS``,

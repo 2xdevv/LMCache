@@ -25,6 +25,8 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -46,6 +48,8 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
     - num_workers: C++ worker threads for I/O (default 8).
     - username: optional auth username.
     - password: optional auth password.
+    - stall_warn_seconds: warn when a connector worker spends this long on
+      one key or on connection setup (default 90 s, 0 disables).
     """
 
     def __init__(
@@ -56,6 +60,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         username: str = "",
         password: str = "",
         max_capacity_gb: float = 0,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ):
         super().__init__()
         self.host = host
@@ -64,6 +69,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         self.username = username
         self.password = password
         self.max_capacity_gb = max_capacity_gb
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict) -> "RESPL2AdapterConfig":
@@ -96,6 +102,8 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
+
         return cls(
             host=host,
             port=port,
@@ -103,6 +111,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             username=str(username),
             password=str(password),
             max_capacity_gb=float(max_capacity_gb),
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -121,7 +130,7 @@ class RESPL2AdapterConfig(L2AdapterConfigBase):
             "(default empty)\n"
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)\n\n"
+            "(default 0 = disabled)\n" + STALL_WARN_SECONDS_HELP + "\n\n"
             "Environment variable defaults (used when "
             "config value is empty, read at adapter "
             "creation, not stored in config):\n"
@@ -182,6 +191,7 @@ def _create_resp_l2_adapter(
         native_client,
         MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
         max_capacity_gb=config.max_capacity_gb,
+        stall_warn_seconds=config.stall_warn_seconds,
     )
 
 

@@ -24,7 +24,9 @@ example usage (see `redis/pybind.cpp`):
 
 Changing the methods below changes the Python API of the NIXL connector, which
 ships as the separate lmcache-nixl package: bump API_VERSION in
-`nixl/pybind.cpp` too.
+`nixl/pybind.cpp` too. A method the Python adapter treats as optional (it
+checks for it before calling, as with worker_status) is additive and needs no
+bump: an older wheel without it keeps working.
 */
 
 #define LMCACHE_BIND_CONNECTOR_METHODS(ConnectorType)                  \
@@ -47,6 +49,9 @@ ships as the separate lmcache-nixl package: bump API_VERSION in
            py::arg("keys"))                                            \
       .def("drain_completions",                                        \
            lmcache::connector::pybind_utils::bind_drain_completions<   \
+               ConnectorType>())                                       \
+      .def("worker_status",                                            \
+           lmcache::connector::pybind_utils::bind_worker_status<       \
                ConnectorType>())                                       \
       .def("close", &ConnectorType::close)
 
@@ -161,6 +166,51 @@ auto bind_drain_completions() {
     return result;
   };
 }
+/*
+worker_status() -> {"workers": [dict, ...], "queues": [dict, ...]}
+
+each worker dict: lane, index, state, op, future_id, key, seconds, activity.
+each queue dict: lane, depth, oldest_seconds. see WorkerStatusEntry and
+QueueStatusEntry in connector_types.h.
+*/
+template <typename ConnectorType>
+auto bind_worker_status() {
+  return [](ConnectorType& self) {
+    ConnectorStatus status;
+    {
+      py::gil_scoped_release release;
+      status = self.worker_status();
+    }
+
+    py::list workers;
+    for (const auto& w : status.workers) {
+      py::dict d;
+      d["lane"] = w.lane;
+      d["index"] = w.index;
+      d["state"] = w.state;
+      d["op"] = w.op;
+      d["future_id"] = w.future_id;
+      d["key"] = w.key;
+      d["seconds"] = w.seconds;
+      d["activity"] = w.activity;
+      workers.append(std::move(d));
+    }
+    py::list queues;
+    for (const auto& q : status.queues) {
+      py::dict d;
+      d["lane"] = q.lane;
+      d["depth"] = q.depth;
+      d["oldest_seconds"] = q.oldest_seconds;
+      queues.append(std::move(d));
+    }
+
+    py::dict result;
+    result["workers"] = std::move(workers);
+    result["queues"] = std::move(queues);
+    return result;
+  };
+}
+
 inline WorkerPoolConfig parse_per_op_workers(const py::object& obj) {
   if (obj.is_none()) {
     return {};

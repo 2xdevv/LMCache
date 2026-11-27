@@ -56,10 +56,14 @@ If the Mooncake headers are not installed in the system include path
   shared ``num_workers`` pool.  There is no requirement to set all
   keys — you can configure only the lanes that need dedicated pools.
 
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one batch tile or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
+
 **Mooncake fields:**
 
 All other keys in the JSON config (except ``type``, ``num_workers``,
-``per_op_workers``, and ``eviction``) are forwarded **as-is** to Mooncake's
+``per_op_workers``, ``stall_warn_seconds``, and ``eviction``) are forwarded **as-is** to Mooncake's
 ``setup_internal(ConfigDict)``.  Refer to the
 `Mooncake documentation <https://github.com/kvcache-ai/Mooncake>`_
 for available setup keys (e.g., ``local_hostname``,

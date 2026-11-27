@@ -282,6 +282,23 @@ looks up each `future_id` to determine its operation type, routes the
 result to the correct completion dict, and signals the corresponding
 Python eventfd.
 
+The same thread also runs the stall watchdog: every few seconds it calls the
+connector's `worker_status()` (bound by `LMCACHE_BIND_CONNECTOR_METHODS`) and
+warns about a worker that has spent `stall_warn_seconds` on one key. A new
+backend gets this for free from `ConnectorBase`:
+
+- Workers started by `start_workers()` publish their state automatically, and
+  the default `do_batch_*()` loops report each key.
+- An override of `do_batch_*()` that hands a whole tile to its backend should
+  call `set_current_key_(key)` before each key it can name; otherwise it is
+  reported per tile, without a key.
+- Threads the connector starts itself (like `fs_native`'s read pool) need a
+  slot from `register_worker_slot()` during construction, bound with
+  `bind_worker_slot_()`; queues of their own are reported by overriding
+  `append_queue_status()`.
+
+See `docs/design/v1/distributed/l2_adapters/native_worker_watchdog.md`.
+
 ## Checklist for a new backend
 
 - [ ] C++ connector inheriting `ConnectorBase<T>` with 4 required + 1 optional (`do_single_delete`) method overrides

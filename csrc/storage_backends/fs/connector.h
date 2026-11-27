@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -85,6 +86,9 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
                                        const std::string& key) override;
 
   void on_workers_stopped() override;
+  // Reports the read pool's key queue as lane "read_pool".
+  void append_queue_status(std::vector<QueueStatusEntry>& queues,
+                           std::chrono::steady_clock::time_point now) override;
 
  private:
   // A lookup or read batch queued on the pool, shaped like Request: buf_* are
@@ -101,6 +105,7 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
     size_t remaining = 0;
     bool any_failed = false;  // set by lookups; reads fail per key instead
     std::string first_error;
+    std::chrono::steady_clock::time_point enqueued_at{};
   };
   using PoolQueue = std::deque<std::shared_ptr<PoolBatch>>;
 
@@ -119,12 +124,14 @@ class FSConnector : public ConnectorBase<WorkerFSConn> {
 
   void start_read_pool(int num_read_workers);
   void stop_read_pool();
-  void read_thread_main(WorkerFSConn& conn);
+  void read_thread_main(WorkerFSConn& conn, WorkerSlot& slot);
 
   // Claim one key, run it unlocked, and record it.  Called and return with
-  // `lk` holding read_mu_.
-  void run_lookup(WorkerFSConn& conn, std::unique_lock<std::mutex>& lk);
-  void run_read(WorkerFSConn& conn, std::unique_lock<std::mutex>& lk);
+  // `lk` holding read_mu_.  `slot` shows the key as running while it runs.
+  void run_lookup(WorkerFSConn& conn, WorkerSlot& slot,
+                  std::unique_lock<std::mutex>& lk);
+  void run_read(WorkerFSConn& conn, WorkerSlot& slot,
+                std::unique_lock<std::mutex>& lk);
   // Claims the next key of the front batch, dequeuing the batch once all its
   // keys are claimed.  Requires read_mu_.
   static std::pair<std::shared_ptr<PoolBatch>, size_t> claim_next_key(

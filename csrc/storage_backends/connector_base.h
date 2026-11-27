@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <memory>
@@ -40,6 +41,13 @@ class:
 optionally override do_single_delete() to support eviction (default returns
 false for all keys), or do_single_delete_result() when the backend can tell
 an absent key from a failed delete.
+
+every worker thread publishes its activity in a WorkerSlot, which
+worker_status() snapshots for the Python adapter's stall watchdog. the default
+do_batch_*() loops report each key; an override that hands a whole tile to its
+backend can call set_current_key_() to report progress. a connector running
+work on its own threads registers them with register_worker_slot() and reports
+its queues through append_queue_status().
 
 see the RedisConnector (csrc/redis/) implementing the RESP2 protocol over TCP
 for an example
@@ -215,6 +223,31 @@ class ConnectorBase : public IStorageConnector {
     return completions_list;
   }
 
+  /*
+  snapshot of every worker's activity and every work queue's age, for the
+  Python adapter's stall watchdog (see
+  docs/design/v1/distributed/l2_adapters/native_worker_watchdog.md).
+
+  safe to call from any thread once the constructor has returned; it only
+  takes the per-slot and per-queue locks, each for a copy.
+  */
+  ConnectorStatus worker_status() {
+    const auto now = std::chrono::steady_clock::now();
+    ConnectorStatus status;
+    status.workers.reserve(worker_slots_.size());
+    for (const auto& slot : worker_slots_) {
+      status.workers.push_back(slot->snapshot(now));
+    }
+    if (!workers_.empty()) {
+      status.queues.push_back(queue_status("shared", req_mu_, requests_, now));
+    }
+    for (auto& [key, lane] : lanes_) {
+      status.queues.push_back(queue_status(key, lane->mu, lane->requests, now));
+    }
+    append_queue_status(status.queues, now);
+    return status;
+  }
+
   void close() override {
     if (closed_.exchange(true, std::memory_order_acq_rel)) {
       return;  // Already closed
@@ -275,7 +308,7 @@ class ConnectorBase : public IStorageConnector {
       if (!lane_ptr) {
         lane_ptr = std::make_unique<WorkerLane>();
       }
-      start_lane_workers(*lane_ptr, count);
+      start_lane_workers(*lane_ptr, key, count);
     }
 
     // Start shared pool if any lane key in the registry is not configured.
@@ -291,9 +324,44 @@ class ConnectorBase : public IStorageConnector {
     if (need_shared) {
       workers_.reserve(static_cast<size_t>(num_workers_));
       for (int i = 0; i < num_workers_; i++) {
-        workers_.emplace_back([this]() { this->worker_loop(); });
+        WorkerSlot* slot = &register_worker_slot("shared", i);
+        workers_.emplace_back([this, slot]() { this->worker_loop(*slot); });
       }
     }
+  }
+
+  /*
+  register the activity slot of a thread the connector runs work on. call
+  only while constructing the connector, before worker_status() can run; the
+  slot lives as long as the connector. the thread binds it with
+  bind_worker_slot_() and updates it as it works.
+  */
+  WorkerSlot& register_worker_slot(std::string lane, int index) {
+    worker_slots_.push_back(
+        std::make_unique<WorkerSlot>(std::move(lane), index));
+    return *worker_slots_.back();
+  }
+
+  // make `slot` the calling thread's slot for set_current_key_().
+  static void bind_worker_slot_(WorkerSlot* slot) { tls_worker_slot_ = slot; }
+
+  /*
+  record that the calling worker is about to run `key`, restarting its stall
+  timer. a no-op on a thread without a slot, so connector code shared with
+  other threads can call it unconditionally.
+  */
+  static void set_current_key_(const std::string& key) {
+    if (tls_worker_slot_ != nullptr) {
+      tls_worker_slot_->set_key(key);
+    }
+  }
+
+  // add queues that live outside ConnectorBase (e.g. a connector's own key
+  // queue) to worker_status().
+  virtual void append_queue_status(std::vector<QueueStatusEntry>& queues,
+                                   std::chrono::steady_clock::time_point now) {
+    (void)queues;
+    (void)now;
   }
 
   virtual ConnectionType create_connection() = 0;
@@ -322,6 +390,7 @@ class ConnectorBase : public IStorageConnector {
   }
   virtual void do_batch_get(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
+      set_current_key_(req.keys[i]);
       try {
         do_single_get(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
                       req.batch_chunk_num_bytes);
@@ -335,18 +404,21 @@ class ConnectorBase : public IStorageConnector {
   }
   virtual void do_batch_set(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
+      set_current_key_(req.keys[i]);
       do_single_set(conn, req.keys[i], req.buf_ptrs[i], req.buf_lens[i],
                     req.batch_chunk_num_bytes);
     }
   }
   virtual void do_batch_exists(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
+      set_current_key_(req.keys[i]);
       bool exists = do_single_exists(conn, req.keys[i]);
       req.batch->per_key_results[req.start_idx + i] = exists ? 1 : 0;
     }
   }
   virtual void do_batch_delete(ConnectionType& conn, const Request& req) {
     for (size_t i = 0; i < req.keys.size(); ++i) {
+      set_current_key_(req.keys[i]);
       try {
         req.batch->per_key_results[req.start_idx + i] =
             static_cast<uint8_t>(do_single_delete_result(conn, req.keys[i]));
@@ -462,6 +534,7 @@ class ConnectorBase : public IStorageConnector {
   }
 
   void enqueue_request(Request&& req) {
+    req.enqueued_at = std::chrono::steady_clock::now();
     const std::string& key = lane_key_for_op(req.op);
     auto it = lanes_.find(key);
     if (it != lanes_.end()) {
@@ -517,12 +590,14 @@ class ConnectorBase : public IStorageConnector {
     return it->second;
   }
 
-  void start_lane_workers(WorkerLane& lane, int num_workers) {
+  void start_lane_workers(WorkerLane& lane, const std::string& lane_key,
+                          int num_workers) {
     lane.workers.reserve(static_cast<size_t>(num_workers));
     WorkerLane* lane_ptr = &lane;
     for (int i = 0; i < num_workers; i++) {
-      lane.workers.emplace_back([this, lane_ptr]() {
-        this->worker_loop_for_queue(lane_ptr->mu, lane_ptr->cv,
+      WorkerSlot* slot = &register_worker_slot(lane_key, i);
+      lane.workers.emplace_back([this, lane_ptr, slot]() {
+        this->worker_loop_for_queue(*slot, lane_ptr->mu, lane_ptr->cv,
                                     lane_ptr->requests);
       });
     }
@@ -543,14 +618,33 @@ class ConnectorBase : public IStorageConnector {
     }
   }
 
-  void worker_loop() { worker_loop_for_queue(req_mu_, req_cv_, requests_); }
+  static QueueStatusEntry queue_status(
+      const std::string& lane, std::mutex& mu,
+      const std::queue<Request>& requests,
+      std::chrono::steady_clock::time_point now) {
+    QueueStatusEntry entry;
+    entry.lane = lane;
+    std::lock_guard<std::mutex> lk(mu);
+    entry.depth = requests.size();
+    if (!requests.empty()) {
+      entry.oldest_seconds = seconds_since(requests.front().enqueued_at, now);
+    }
+    return entry;
+  }
 
-  void worker_loop_for_queue(std::mutex& req_mu,
+  void worker_loop(WorkerSlot& slot) {
+    worker_loop_for_queue(slot, req_mu_, req_cv_, requests_);
+  }
+
+  void worker_loop_for_queue(WorkerSlot& slot, std::mutex& req_mu,
                              std::condition_variable& req_cv,
                              std::queue<Request>& requests) {
+    bind_worker_slot_(&slot);
     try {
-      // create connection (derived class specific)
+      // create connection (derived class specific); the slot stays
+      // "starting" until it returns
       ConnectionType conn = create_connection();
+      slot.set_idle();
 
       for (;;) {
         Request req;
@@ -567,6 +661,7 @@ class ConnectorBase : public IStorageConnector {
           req = std::move(requests.front());
           requests.pop();
         }
+        slot.begin_tile(req.op, req.future_id);
 
         Completion comp;
         comp.future_id = req.future_id;
@@ -603,6 +698,8 @@ class ConnectorBase : public IStorageConnector {
           }
         }
 
+        slot.set_idle();
+
         // 3. update shared batch state and push completion when done
         handle_tile_completion(req, comp);
       }
@@ -611,6 +708,7 @@ class ConnectorBase : public IStorageConnector {
     } catch (...) {
       fprintf(stderr, "[LMCache Connector Worker Error] Unknown exception\n");
     }
+    slot.set_exited();
   }
 
   void handle_tile_completion(const Request& req, const Completion& comp) {
@@ -675,6 +773,14 @@ class ConnectorBase : public IStorageConnector {
   // Populated only during start_workers() (single-threaded construction).
   // All subsequent accesses are reads — no lock needed in enqueue_request.
   std::unordered_map<std::string, std::unique_ptr<WorkerLane>> lanes_;
+
+  // Filled only by register_worker_slot() during construction, so
+  // worker_status() reads it without a lock. unique_ptr keeps each slot at a
+  // fixed address while the vector grows.
+  std::vector<std::unique_ptr<WorkerSlot>> worker_slots_;
+
+  // the calling thread's slot, set by bind_worker_slot_()
+  static inline thread_local WorkerSlot* tls_worker_slot_ = nullptr;
 };
 
 }  // namespace connector

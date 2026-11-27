@@ -15,18 +15,23 @@ Architecture:
     submit call boundary.
   - Locking is client-side (refcount dict) since remote backends don't have
     our eviction concept.
+  - The demux thread also scans the native client's worker_status() and warns
+    about workers stuck on one key (see
+    docs/design/v1/distributed/l2_adapters/native_worker_watchdog.md).
 """
 
 # Future
 from __future__ import annotations
 
 # Standard
-from collections import defaultdict
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from functools import cache
 from typing import Any
 import ctypes
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -38,10 +43,18 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
     L2TaskId,
 )
+from lmcache.v1.distributed.l2_adapters.config import DEFAULT_STALL_WARN_SECONDS
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
 from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
+
+# Longest gap between worker_status() scans; shorter thresholds scan more
+# often so a stall is reported soon after it crosses the threshold.
+_STALL_SCAN_MAX_INTERVAL_SECONDS = 5.0
+
+# Worker states in which a worker is busy and can be stuck.
+_BUSY_WORKER_STATES = ("starting", "running")
 
 
 @cache
@@ -111,6 +124,130 @@ def _obj_to_memoryview(
     return obj.byte_array  # type: ignore[return-value]
 
 
+@dataclass
+class _WarnedWorker:
+    """A worker already reported as stuck, and on which activity."""
+
+    activity: int
+    seconds: float
+
+
+class _StallWatchdog:
+    """Turns ``worker_status()`` snapshots into stall warnings.
+
+    Reports a worker once when one activity (a key, or connection setup) has
+    lasted ``threshold_seconds``, and once more when that worker moves on,
+    i.e. its ``activity`` counter changes. It never interrupts the worker.
+    """
+
+    def __init__(self, type_name: str, threshold_seconds: float) -> None:
+        """Create a watchdog.
+
+        Args:
+            type_name: Adapter label used as the log prefix.
+            threshold_seconds: Positive time one activity may take before it
+                counts as a stall.
+        """
+        self._type_name = type_name
+        self._threshold_seconds = threshold_seconds
+        self._warned: dict[tuple[str, int], _WarnedWorker] = {}
+        #: Seconds between scans.
+        self.scan_interval = min(
+            _STALL_SCAN_MAX_INTERVAL_SECONDS, threshold_seconds / 4
+        )
+        #: Workers past the threshold at the last scan.
+        self.stalled_workers = 0
+        #: Longest current activity among busy workers at the last scan.
+        self.oldest_busy_seconds = 0.0
+
+    def scan(self, status: dict[str, list[dict[str, Any]]]) -> None:
+        """Log new stalls and recoveries found in one snapshot.
+
+        Args:
+            status: The dict returned by the native client's
+                ``worker_status()``.
+        """
+        workers = status["workers"]
+        queues = {queue["lane"]: queue for queue in status["queues"]}
+        lane_sizes = Counter(worker["lane"] for worker in workers)
+        lane_busy = Counter(
+            worker["lane"]
+            for worker in workers
+            if worker["state"] in _BUSY_WORKER_STATES
+        )
+
+        stalled = 0
+        oldest = 0.0
+        for worker in workers:
+            ident = (worker["lane"], worker["index"])
+            warned = self._warned.get(ident)
+            if warned is not None and warned.activity != worker["activity"]:
+                logger.warning(
+                    "%s: worker %s#%d moved on after being stuck for at least %.0f s",
+                    self._type_name,
+                    worker["lane"],
+                    worker["index"],
+                    warned.seconds,
+                )
+                del self._warned[ident]
+                warned = None
+
+            if worker["state"] not in _BUSY_WORKER_STATES:
+                continue
+            oldest = max(oldest, worker["seconds"])
+            if worker["seconds"] < self._threshold_seconds:
+                continue
+            stalled += 1
+            if warned is not None:
+                warned.seconds = worker["seconds"]
+                continue
+            self._warned[ident] = _WarnedWorker(worker["activity"], worker["seconds"])
+            self._warn_stall(
+                worker,
+                lane_busy[worker["lane"]],
+                lane_sizes[worker["lane"]],
+                queues.get(worker["lane"]),
+            )
+
+        self.stalled_workers = stalled
+        self.oldest_busy_seconds = oldest
+
+    def _warn_stall(
+        self,
+        worker: dict[str, Any],
+        lane_busy: int,
+        lane_size: int,
+        queue: dict[str, Any] | None,
+    ) -> None:
+        """Log one stuck worker, with its lane's load for context."""
+        lane = f"lane {worker['lane']}: {lane_busy}/{lane_size} workers busy"
+        if queue is not None:
+            lane += (
+                f", {queue['depth']} queued (oldest {queue['oldest_seconds']:.0f} s)"
+            )
+        if worker["state"] == "starting":
+            logger.warning(
+                "%s: worker %s#%d still setting up its connection after %.0f s; %s",
+                self._type_name,
+                worker["lane"],
+                worker["index"],
+                worker["seconds"],
+                lane,
+            )
+            return
+        logger.warning(
+            "%s: worker %s#%d stuck in %s on key %s (future %d) for %.0f s; %s",
+            self._type_name,
+            worker["lane"],
+            worker["index"],
+            worker["op"],
+            worker["key"] or "(not reported)",
+            worker["future_id"],
+            worker["seconds"],
+            lane,
+        )
+
+
 class NativeConnectorL2Adapter(L2AdapterInterface):
     """
     Wraps a pybind-wrapped C++ IStorageConnector to
@@ -124,6 +261,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
       - drain_completions()
           -> list[tuple[int, bool, str, list[bool]|None]]
       - close()
+
+    and may expose ``worker_status()`` (see ``LMCACHE_BIND_CONNECTOR_METHODS``)
+    for the stall watchdog; without it the watchdog stays off.
     """
 
     # Operation type tags for the pending-ops map
@@ -140,6 +280,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         type_name: str = "",
         extra_status: dict[str, Any] | None = None,
         pad_buffers_to_alignment: bool = False,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ) -> None:
         """Initialize the adapter over a native connector client.
 
@@ -160,6 +301,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 native connectors whose I/O path requires aligned buffer
                 lengths (e.g. O_DIRECT file storage). See
                 ``_obj_to_memoryview``.
+            stall_warn_seconds: Warn when a connector worker spends this long
+                on one key or on connection setup. ``0`` disables the
+                watchdog, as does a client without ``worker_status()``.
         """
         super().__init__(max_capacity_bytes=int(max_capacity_gb * (1024**3)))
         self._client = native_client
@@ -213,6 +357,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         # Lock for all shared state above
         self._lock = threading.Lock()
+
+        # Stall watchdog, run by the demux thread
+        self._stall_watchdog: _StallWatchdog | None = None
+        if stall_warn_seconds > 0 and callable(
+            getattr(native_client, "worker_status", None)
+        ):
+            self._stall_watchdog = _StallWatchdog(self._type_name, stall_warn_seconds)
+        self._next_stall_scan = 0.0
 
         # Background demux thread
         self._stop = threading.Event()
@@ -415,6 +567,12 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
                 thread is alive and not stopping.
               * ``type`` (str): Stable adapter type label, supplied by the
                 factory or derived from the native client class name.
+            While the stall watchdog is on, also:
+              * ``stalled_workers`` (int): connector workers past
+                ``stall_warn_seconds`` at the last scan.
+              * ``oldest_busy_seconds`` (float): the longest time any worker
+                has spent on its current key or connection setup, at the
+                last scan.
             Plus any caller-supplied ``extra_status`` fields (e.g. backend
             configuration like ``base_path``, ``num_workers``).
         """
@@ -422,6 +580,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             "is_healthy": (self._demux_thread.is_alive() and not self._stop.is_set()),
             "type": self._type_name,
         }
+        if self._stall_watchdog is not None:
+            status["stalled_workers"] = self._stall_watchdog.stalled_workers
+            status["oldest_busy_seconds"] = self._stall_watchdog.oldest_busy_seconds
         status.update(self._extra_status)
         return status
 
@@ -464,6 +625,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
 
         while not self._stop.is_set():
             events = poller.poll(500)
+            self._scan_workers_if_due()
             if not events:
                 continue
 
@@ -600,3 +762,14 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
             # returning and the notify running.
             for evt in delete_done_events:
                 evt.set()
+
+    def _scan_workers_if_due(self) -> None:
+        """Run the stall watchdog over a fresh ``worker_status()`` snapshot
+        when its scan interval has passed. Called from the demux thread."""
+        if self._stall_watchdog is None:
+            return
+        now = time.monotonic()
+        if now < self._next_stall_scan:
+            return
+        self._next_stall_scan = now + self._stall_watchdog.scan_interval
+        self._stall_watchdog.scan(self._client.worker_status())

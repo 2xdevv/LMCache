@@ -17,6 +17,8 @@ from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -117,6 +119,8 @@ class NixlNativeL2AdapterConfig(L2AdapterConfigBase):
         num_workers: Number of native connector workers and NIXL agents.
         max_capacity_gb: Capacity used for L2 accounting. Zero disables the
             capacity limit.
+        stall_warn_seconds: Warn when a connector worker spends this long on
+            one tile or on connection setup. Zero disables the watchdog.
     """
 
     def __init__(
@@ -125,11 +129,13 @@ class NixlNativeL2AdapterConfig(L2AdapterConfigBase):
         backend_params: dict[str, str],
         num_workers: int = 4,
         max_capacity_gb: float = 0,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ) -> None:
         self.backend = backend
         self.backend_params = dict(backend_params)
         self.num_workers = num_workers
         self.max_capacity_gb = max_capacity_gb
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "NixlNativeL2AdapterConfig":
@@ -179,11 +185,14 @@ class NixlNativeL2AdapterConfig(L2AdapterConfigBase):
         ):
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
+
         return cls(
             backend=backend,
             backend_params=backend_params,
             num_workers=num_workers,
             max_capacity_gb=float(max_capacity_gb),
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -195,7 +204,8 @@ class NixlNativeL2AdapterConfig(L2AdapterConfigBase):
             "- backend_params (dict[str, str]): parameters forwarded to NIXL; "
             "FILE_SEG backends require file_path and accept use_direct_io\n"
             "- num_workers (int): worker/agent count (default 4, >0)\n"
-            "- max_capacity_gb (float): accounting capacity (default 0)"
+            "- max_capacity_gb (float): accounting capacity (default 0)\n"
+            + STALL_WARN_SECONDS_HELP
         )
 
 
@@ -282,6 +292,7 @@ def _create_nixl_native_l2_adapter(
         type_name="nixl_native",
         extra_status=status,
         pad_buffers_to_alignment=pad_buffers_to_alignment,
+        stall_warn_seconds=config.stall_warn_seconds,
     )
 
 

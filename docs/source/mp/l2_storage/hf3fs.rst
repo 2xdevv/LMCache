@@ -74,6 +74,9 @@ The **BUILD_HF3FS** environment variable controls compilation:
   Operations whose lane key is **not** present in the dict use the
   shared ``num_workers`` pool.  There is no requirement to set all
   keys — you can configure only the lanes that need dedicated pools.
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one key or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
 
 **HF3FS Fields**
 

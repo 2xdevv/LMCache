@@ -385,3 +385,44 @@ Expected log messages when L2 is active:
     LMCache DEBUG: Submitted store task ...
     LMCache DEBUG: L2 store task N completed ...
     LMCache DEBUG: Prefetch request submitted: X total keys, Y L1 prefix hits, Z remaining for L2
+
+.. _l2-native-stall-watchdog:
+
+Stalled Native Connector Workers
+--------------------------------
+
+Native (C++) adapters (``fs_native``, ``hf3fs``, ``resp``, ``aerospike``,
+``mooncake_store``, ``nixl_native`` and ``native_plugin``) run storage
+calls on worker threads, and most of those calls have no deadline: a 3FS
+completion wait, a file syscall on a network or FUSE filesystem, a TCP read
+from an unresponsive server. When one never returns, the worker stops, the
+batch it serves never completes, and the requests waiting on it hang without
+an error.
+
+These adapters therefore log a warning when a worker has spent
+``stall_warn_seconds`` (default ``90``) on one key, or on setting up its
+connection, and log once more if it moves on. They never cancel the call:
+the warning tells you where to look.
+
+.. code-block:: text
+
+    LMCache WARNING: Hf3fsL2Adapter: worker store#2 stuck in set on key
+      model@0x0@0@3fa2... (future 17) for 95 s; lane store: 4/4 workers busy,
+      12 queued (oldest 130 s)
+    LMCache WARNING: Hf3fsL2Adapter: worker store#2 moved on after being
+      stuck for at least 95 s
+
+``report_status()`` of the adapter also carries ``stalled_workers`` and
+``oldest_busy_seconds``. Set ``"stall_warn_seconds": 0`` in the adapter's
+JSON to turn the watchdog off; keep the threshold above the backend's own
+retry window, or failovers that recover on their own will be reported.
+
+When a warning appears:
+
+1. If a ``moved on`` line follows, the backend recovered by itself; look
+   on the storage side for why it was slow.
+2. Otherwise dump the server's native stacks
+   (``py-spy dump --native --pid <pid>``) to see which call the worker is
+   blocked in, and check the backend (mount, server or cluster health).
+3. A backend client that cannot recover in place needs a server restart.
+   Graceful shutdown waits for the blocked worker, so it may hang too.

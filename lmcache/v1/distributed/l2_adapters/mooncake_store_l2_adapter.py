@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.api import MemoryResidency, MemorySegment, MemoryTags
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -40,6 +42,7 @@ _LMCACHE_ONLY_KEYS = {
     "num_workers",
     "eviction",
     "per_op_workers",
+    "stall_warn_seconds",
 }
 
 
@@ -64,6 +67,9 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             (``"lookup"``, ``"retrieve"``, ``"store"``,
             ``"delete"``) to dedicated worker counts.  Ops
             not mentioned use the shared ``num_workers`` pool.
+        stall_warn_seconds: Warn when a connector worker spends
+            this long on one tile or on connection setup
+            (default 90 s, 0 disables).
     """
 
     def __init__(
@@ -71,6 +77,7 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
         setup_config: dict[str, str],
         num_workers: int = 4,
         per_op_workers: dict[str, int] | None = None,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ):
         super().__init__()
         self.num_workers = L2AdapterConfigBase._validate_num_workers(num_workers)
@@ -78,14 +85,15 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             per_op_workers
         )
         self.setup_config: dict[str, str] = dict(setup_config)
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> "MooncakeStoreL2AdapterConfig":
         """Construct a config from a raw configuration dict.
 
         LMCache-only keys (``type``, ``num_workers``, ``eviction``,
-        ``per_op_workers``) are consumed locally.  All other keys are
-        forwarded to mooncake as string values.
+        ``per_op_workers``, ``stall_warn_seconds``) are consumed locally.
+        All other keys are forwarded to mooncake as string values.
 
         Args:
             d: Raw configuration dict (typically from JSON/CLI).
@@ -94,12 +102,13 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             A validated ``MooncakeStoreL2AdapterConfig``.
 
         Raises:
-            ValueError: If ``num_workers`` or ``per_op_workers`` values
-                are invalid.
+            ValueError: If ``num_workers``, ``per_op_workers`` or
+                ``stall_warn_seconds`` values are invalid.
         """
         num_workers = cast(int, d.get("num_workers", 4))  # validated in __init__
 
         per_op_workers = L2AdapterConfigBase._parse_per_op_workers_from_dict(d)
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
         # Everything except LMCache-only keys is
         # forwarded to mooncake as str values.
         setup: dict[str, str] = {}
@@ -113,6 +122,7 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             setup_config=setup,
             num_workers=num_workers,
             per_op_workers=per_op_workers,
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -134,7 +144,7 @@ class MooncakeStoreL2AdapterConfig(L2AdapterConfigBase):
             "dict mapping lane keys to dedicated worker "
             "counts. Valid keys: lookup, retrieve, "
             "store, delete. Ops not mentioned use the "
-            "shared num_workers pool."
+            "shared num_workers pool.\n" + STALL_WARN_SECONDS_HELP
         )
 
 
@@ -209,7 +219,9 @@ def _create_mooncake_store_l2_adapter(
         l1_registration.enabled and l1_registration.size > 0,
     )
     return NativeConnectorL2Adapter(
-        native_client, MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE)
+        native_client,
+        MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
+        stall_warn_seconds=config.stall_warn_seconds,
     )
 
 

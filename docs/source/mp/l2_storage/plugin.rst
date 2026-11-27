@@ -94,6 +94,9 @@ a no-op (logged as a warning).
   to the connector constructor.
 - ``max_capacity_gb`` (float, default ``0``): Aggregate L2 capacity in GB for
   usage tracking / eviction.  ``0`` disables aggregate eviction.
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one key or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
 
 **Configuration examples:**
 

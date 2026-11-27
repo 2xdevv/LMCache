@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "connector.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -317,6 +318,7 @@ void FSConnector::enqueue_pool_batch(PoolQueue& queue,
   {
     std::lock_guard<std::mutex> lk(read_mu_);
     if (!read_stop_) {
+      batch->enqueued_at = std::chrono::steady_clock::now();
       queue.push_back(std::move(batch));
       wake = has_ready_read_work();
     }
@@ -354,8 +356,9 @@ void FSConnector::start_read_pool(int num_read_workers) {
   }
   read_threads_.reserve(num_threads);
   for (size_t i = 0; i < num_threads; ++i) {
+    WorkerSlot* slot = &register_worker_slot("read_pool", static_cast<int>(i));
     read_threads_.emplace_back(
-        [this, i] { this->read_thread_main(read_conns_[i]); });
+        [this, i, slot] { this->read_thread_main(read_conns_[i], *slot); });
   }
 }
 
@@ -377,25 +380,52 @@ void FSConnector::stop_read_pool() {
   read_conns_.clear();
 }
 
-void FSConnector::read_thread_main(WorkerFSConn& conn) {
+void FSConnector::read_thread_main(WorkerFSConn& conn, WorkerSlot& slot) {
+  bind_worker_slot_(&slot);
+  slot.set_idle();
   std::unique_lock<std::mutex> lk(read_mu_);
   for (;;) {
     read_cv_.wait(lk, [this] { return read_stop_ || has_ready_read_work(); });
     if (read_stop_) {
-      return;
+      break;
     }
     if (!exists_queue_.empty()) {
-      run_lookup(conn, lk);
+      run_lookup(conn, slot, lk);
     } else {
-      run_read(conn, lk);
+      run_read(conn, slot, lk);
     }
   }
+  slot.set_exited();
 }
 
-void FSConnector::run_lookup(WorkerFSConn& conn,
+void FSConnector::append_queue_status(
+    std::vector<QueueStatusEntry>& queues,
+    std::chrono::steady_clock::time_point now) {
+  if (read_max_bytes_in_flight_ == 0) {
+    return;
+  }
+  QueueStatusEntry entry;
+  entry.lane = "read_pool";
+  std::lock_guard<std::mutex> lk(read_mu_);
+  for (const PoolQueue* queue : {&exists_queue_, &get_queue_}) {
+    for (const auto& batch : *queue) {
+      entry.depth += batch->keys.size() - batch->next_idx;
+    }
+    if (!queue->empty()) {
+      entry.oldest_seconds =
+          std::max(entry.oldest_seconds,
+                   seconds_since(queue->front()->enqueued_at, now));
+    }
+  }
+  queues.push_back(std::move(entry));
+}
+
+void FSConnector::run_lookup(WorkerFSConn& conn, WorkerSlot& slot,
                              std::unique_lock<std::mutex>& lk) {
   auto [batch, idx] = claim_next_key(exists_queue_);
   unlock_and_wake_next(lk);
+  slot.begin_tile(Op::BATCH_TILE_EXISTS, batch->future_id);
+  slot.set_key(batch->keys[idx]);
 
   uint8_t found = 0;
   bool failed = false;
@@ -409,6 +439,7 @@ void FSConnector::run_lookup(WorkerFSConn& conn,
     failed = true;
     err = "unknown exception";
   }
+  slot.set_idle();
 
   lk.lock();
   if (failed) {
@@ -420,7 +451,7 @@ void FSConnector::run_lookup(WorkerFSConn& conn,
   finish_key(lk, *batch, idx, found);
 }
 
-void FSConnector::run_read(WorkerFSConn& conn,
+void FSConnector::run_read(WorkerFSConn& conn, WorkerSlot& slot,
                            std::unique_lock<std::mutex>& lk) {
   auto [batch, idx] = claim_next_key(get_queue_);
   const size_t len = batch->buf_lens[idx];
@@ -430,6 +461,8 @@ void FSConnector::run_read(WorkerFSConn& conn,
 
   uint8_t ok = 1;
   const std::string& key = batch->keys[idx];
+  slot.begin_tile(Op::BATCH_TILE_GET, batch->future_id);
+  slot.set_key(key);
   try {
     do_single_get(conn, key, batch->buf_ptrs[idx], len,
                   batch->batch_chunk_num_bytes);
@@ -441,6 +474,7 @@ void FSConnector::run_read(WorkerFSConn& conn,
     fprintf(stderr, "[LMCache GET] key %s failed: unknown exception\n",
             key.c_str());
   }
+  slot.set_idle();
 
   lk.lock();
   read_bytes_in_flight_ -= len;

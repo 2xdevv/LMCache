@@ -33,6 +33,19 @@ logger = init_logger(__name__)
 
 T = TypeVar("T", bound="L2AdapterConfigBase")
 
+#: Default for the ``stall_warn_seconds`` field of native adapter configs. It
+#: sits above backends' own retry windows (the 3FS storage client retries for
+#: up to 60 s), so a warning means the backend stopped answering. See
+#: docs/design/v1/distributed/l2_adapters/native_worker_watchdog.md.
+DEFAULT_STALL_WARN_SECONDS = 90.0
+
+#: ``help()`` line shared by every native adapter config.
+STALL_WARN_SECONDS_HELP = (
+    "- stall_warn_seconds (float): warn when a native connector worker spends "
+    "this long on one key or on connection setup; 0 disables "
+    f"(default {DEFAULT_STALL_WARN_SECONDS:g})"
+)
+
 
 @dataclass(frozen=True)
 class PersistConfig:
@@ -284,6 +297,27 @@ class L2AdapterConfigBase(ABC):
         """
         persist_enabled = bool(d.get("persist_enabled", True))
         return PersistConfig(persist_enabled=persist_enabled)
+
+    @staticmethod
+    def _parse_stall_warn_seconds(d: dict) -> float:
+        """Parse ``stall_warn_seconds`` from a native adapter's config dict.
+
+        Args:
+            d: Raw configuration dict.
+
+        Returns:
+            The threshold in seconds, ``DEFAULT_STALL_WARN_SECONDS`` when the
+            key is absent; ``0.0`` disables the watchdog.
+
+        Raises:
+            ValueError: If the value is not a non-negative number.
+        """
+        raw = d.get("stall_warn_seconds", DEFAULT_STALL_WARN_SECONDS)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            raise ValueError(
+                f"stall_warn_seconds must be a non-negative number, got {raw!r}"
+            )
+        return float(raw)
 
     @staticmethod
     def _validate_num_workers(raw: object) -> int:

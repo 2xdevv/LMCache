@@ -25,6 +25,8 @@ from lmcache.v1.distributed.l2_adapters.base import (
     L2AdapterInterface,
 )
 from lmcache.v1.distributed.l2_adapters.config import (
+    DEFAULT_STALL_WARN_SECONDS,
+    STALL_WARN_SECONDS_HELP,
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
@@ -49,6 +51,8 @@ class NativePluginL2AdapterConfig(L2AdapterConfigBase):
         *module_path*.
     - adapter_params: Arbitrary dict forwarded to the
         connector class constructor as keyword arguments.
+    - stall_warn_seconds: warn when a connector worker spends this long on
+      one key or on connection setup (default 90 s, 0 disables).
     """
 
     def __init__(
@@ -57,11 +61,13 @@ class NativePluginL2AdapterConfig(L2AdapterConfigBase):
         class_name: str,
         adapter_params: dict[str, Any] | None = None,
         max_capacity_gb: float = 0,
+        stall_warn_seconds: float = DEFAULT_STALL_WARN_SECONDS,
     ):
         self.module_path = module_path
         self.class_name = class_name
         self.adapter_params = adapter_params or {}
         self.max_capacity_gb = max_capacity_gb
+        self.stall_warn_seconds = stall_warn_seconds
 
     @classmethod
     def from_dict(cls, d: dict) -> "NativePluginL2AdapterConfig":
@@ -81,11 +87,14 @@ class NativePluginL2AdapterConfig(L2AdapterConfigBase):
         if not isinstance(max_capacity_gb, (int, float)) or max_capacity_gb < 0:
             raise ValueError("max_capacity_gb must be a non-negative number")
 
+        stall_warn_seconds = L2AdapterConfigBase._parse_stall_warn_seconds(d)
+
         return cls(
             module_path=module_path,
             class_name=class_name,
             adapter_params=adapter_params,
             max_capacity_gb=float(max_capacity_gb),
+            stall_warn_seconds=stall_warn_seconds,
         )
 
     @classmethod
@@ -109,7 +118,7 @@ class NativePluginL2AdapterConfig(L2AdapterConfigBase):
             '{"host": "localhost", "port": 1234}}\n'
             "- max_capacity_gb (float): max L2 capacity "
             "in GB for usage tracking / eviction "
-            "(default 0 = disabled)"
+            "(default 0 = disabled)\n" + STALL_WARN_SECONDS_HELP
         )
 
 
@@ -195,6 +204,7 @@ def _create_native_plugin_l2_adapter(
         native_client,
         MemoryTags(MemorySegment.STORAGE, MemoryResidency.REMOTE),
         max_capacity_gb=config.max_capacity_gb,
+        stall_warn_seconds=config.stall_warn_seconds,
     )
 
 

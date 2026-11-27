@@ -17,6 +17,9 @@ through a C++ worker-thread pool.
 - ``password`` (string, default ``""``): Auth password.
 - ``max_capacity_gb`` (float, default ``0``): Max L2 capacity in GB for usage
   tracking / aggregate eviction. ``0`` disables tracking.
+- ``stall_warn_seconds`` (float, default ``90``): Log a warning when a
+  connector worker spends this long on one key or on connection setup;
+  ``0`` disables it. See :ref:`l2-native-stall-watchdog`.
 
 When ``host``, ``port``, ``username``, or ``password`` are left empty, the
 adapter falls back to the corresponding environment variables at creation

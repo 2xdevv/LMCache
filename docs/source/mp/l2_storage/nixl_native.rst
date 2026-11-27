@@ -94,6 +94,11 @@ Configuration reference
      - ``0``
      - Non-negative capacity for LMCache byte accounting. Zero disables the
        aggregate capacity signal.
+   * - ``stall_warn_seconds``
+     - ``90``
+     - Log a warning when a worker spends this long on one batch tile or on
+       setting up its agent; ``0`` disables it. See
+       :ref:`l2-native-stall-watchdog`.
 
 The adapter rejects missing L1 memory, invalid backend names, backends that
 advertise neither or both storage segments, non-string backend parameters, and

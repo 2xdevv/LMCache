@@ -2,21 +2,25 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
-// there are four "types" in this file:
-// 1. Op: enum class for the three batched operations (GET, SET, EXISTS)
+// the main "types" in this file:
+// 1. Op: enum class for the batched operations (GET, SET, EXISTS, DELETE)
 // 2. BatchState: shared communication state between threads executing a single
 // batch operation
 // 3. Request: the request data structure for a single operation (submitted to
 // SQ)
 // 4. Completion: the completion data structure for a single operation
 // (collected from CQ)
+// 5. WorkerSlot / ConnectorStatus: per-worker activity published for
+// worker_status(), which the Python adapter scans for stalled workers
 
 namespace lmcache {
 namespace connector {
@@ -94,6 +98,9 @@ struct Request {
   // batch_chunk_num_bytes for get/set operations (passed per-operation, not
   // per-connection)
   size_t batch_chunk_num_bytes = 0;
+
+  // set when the tile is queued, so worker_status() can report queue age
+  std::chrono::steady_clock::time_point enqueued_at{};
 };
 
 struct Completion {
@@ -107,6 +114,142 @@ struct Completion {
   std::vector<uint8_t> result_bytes;
 
   std::string error;
+};
+
+enum class WorkerState : uint8_t { STARTING, IDLE, RUNNING, EXITED };
+
+inline const char* worker_state_name(WorkerState state) {
+  switch (state) {
+    case WorkerState::STARTING:
+      return "starting";
+    case WorkerState::IDLE:
+      return "idle";
+    case WorkerState::RUNNING:
+      return "running";
+    case WorkerState::EXITED:
+      return "exited";
+  }
+  return "";
+}
+
+inline const char* op_name(Op op) {
+  switch (op) {
+    case Op::BATCH_TILE_GET:
+      return "get";
+    case Op::BATCH_TILE_SET:
+      return "set";
+    case Op::BATCH_TILE_EXISTS:
+      return "exists";
+    case Op::BATCH_TILE_DELETE:
+      return "delete";
+  }
+  return "";
+}
+
+// One worker's view as returned by worker_status().
+struct WorkerStatusEntry {
+  std::string lane;
+  int index = 0;
+  std::string state;
+  std::string op;  // empty unless running
+  uint64_t future_id = 0;
+  std::string key;  // empty when the connector does not report keys
+  // time in the current state; while running, since the current key started
+  double seconds = 0.0;
+  uint64_t activity = 0;
+};
+
+// One work queue's view as returned by worker_status().
+struct QueueStatusEntry {
+  std::string lane;
+  size_t depth = 0;  // queued work units (tiles, or keys for a key queue)
+  double oldest_seconds = 0.0;
+};
+
+struct ConnectorStatus {
+  std::vector<WorkerStatusEntry> workers;
+  std::vector<QueueStatusEntry> queues;
+};
+
+inline double seconds_since(std::chrono::steady_clock::time_point start,
+                            std::chrono::steady_clock::time_point now) {
+  return std::chrono::duration<double>(now - start).count();
+}
+
+/*
+Activity a worker thread publishes for worker_status().
+
+The owning thread writes it through the methods below; worker_status() reads
+it from another thread. Every change restarts the timer and bumps
+`activity`, so a reader can tell "stuck on the same key" (activity unchanged)
+from "busy on a new key" (activity changed). The mutex is a leaf lock held
+only for the copy, never across I/O.
+*/
+class WorkerSlot {
+ public:
+  WorkerSlot(std::string lane, int index)
+      : lane_(std::move(lane)),
+        index_(index),
+        since_(std::chrono::steady_clock::now()) {}
+
+  WorkerSlot(const WorkerSlot&) = delete;
+  WorkerSlot& operator=(const WorkerSlot&) = delete;
+
+  void set_idle() { transition(WorkerState::IDLE, nullptr, 0); }
+  void set_exited() { transition(WorkerState::EXITED, nullptr, 0); }
+
+  // Start serving a tile of batch `future_id`; the key is unknown until
+  // set_key() is called.
+  void begin_tile(Op op, uint64_t future_id) {
+    transition(WorkerState::RUNNING, &op, future_id);
+  }
+
+  // Record that the running worker moved on to `key`.
+  void set_key(const std::string& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    key_ = key;
+    since_ = std::chrono::steady_clock::now();
+    ++activity_;
+  }
+
+  WorkerStatusEntry snapshot(std::chrono::steady_clock::time_point now) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    WorkerStatusEntry entry;
+    entry.lane = lane_;
+    entry.index = index_;
+    entry.state = worker_state_name(state_);
+    if (state_ == WorkerState::RUNNING) {
+      entry.op = op_name(op_);
+      entry.future_id = future_id_;
+      entry.key = key_;
+    }
+    entry.seconds = seconds_since(since_, now);
+    entry.activity = activity_;
+    return entry;
+  }
+
+ private:
+  void transition(WorkerState state, const Op* op, uint64_t future_id) {
+    std::lock_guard<std::mutex> lk(mu_);
+    state_ = state;
+    if (op != nullptr) {
+      op_ = *op;
+    }
+    future_id_ = future_id;
+    key_.clear();
+    since_ = std::chrono::steady_clock::now();
+    ++activity_;
+  }
+
+  const std::string lane_;
+  const int index_;
+  mutable std::mutex mu_;
+  WorkerState state_ = WorkerState::STARTING;
+  Op op_ = Op::BATCH_TILE_GET;
+  uint64_t future_id_ = 0;
+  std::string key_;
+  std::chrono::steady_clock::time_point since_;
+  uint64_t activity_ = 0;
 };
 
 }  // namespace connector
